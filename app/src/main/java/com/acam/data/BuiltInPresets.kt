@@ -11,7 +11,7 @@ object BuiltInPresets {
         Preset(
             id = "normal", name = "Normal", builtin = true,
             params = EffectParams(),
-            ratio = Ratio.FOUR_THREE, k = 0
+            ratio = Ratio.THREE_FOUR, k = 0
         ),
 
         // ---------------- Old camera looks ----------------

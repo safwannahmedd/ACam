@@ -21,7 +21,9 @@ data class PersistedState(
     val resolution: ResolutionSpec = ResolutionSpec(),
     val video: VideoSettings = VideoSettings(),
     val camera: CameraPrefs = CameraPrefs(),
-    val ui: UiPrefs = UiPrefs()
+    val ui: UiPrefs = UiPrefs(),
+    /** Schema version, used for one-time migrations. */
+    val version: Int = 0
 )
 
 /**
@@ -45,6 +47,7 @@ class SettingsRepository(private val context: Context) {
         val VIDEO = stringPreferencesKey("video_json")
         val CAMERA = stringPreferencesKey("camera_json")
         val UI = stringPreferencesKey("ui_json")
+        val VERSION = stringPreferencesKey("settings_version")
     }
 
     private inline fun <reified T> decode(raw: String?, fallback: T): T {
@@ -61,7 +64,8 @@ class SettingsRepository(private val context: Context) {
             resolution = decode(p[Keys.RESOLUTION], ResolutionSpec()),
             video = decode(p[Keys.VIDEO], VideoSettings()),
             camera = decode(p[Keys.CAMERA], CameraPrefs()),
-            ui = decode(p[Keys.UI], UiPrefs())
+            ui = decode(p[Keys.UI], UiPrefs()),
+            version = decode(p[Keys.VERSION], "0").toIntOrNull() ?: 0
         )
     }
 
@@ -75,12 +79,18 @@ class SettingsRepository(private val context: Context) {
             p[Keys.VIDEO] = json.encodeToString(state.video)
             p[Keys.CAMERA] = json.encodeToString(state.camera)
             p[Keys.UI] = json.encodeToString(state.ui)
+            p[Keys.VERSION] = CURRENT_VERSION.toString()
         }
     }
 
     /** "Reset ALL": wipes everything back to first-run defaults. */
     suspend fun resetAll() {
         context.acamDataStore.edit { it.clear() }
+    }
+
+    companion object {
+        /** Bump when a migration is added; [migrate] runs once per bump. */
+        const val CURRENT_VERSION = 1
     }
 
     // ---- Preset JSON export / import ----

@@ -80,7 +80,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         viewModelScope.launch {
-            val persisted = repo.state.first()
+            val persisted = migrate(repo.state.first())
             if (!_state.value.loaded) {
                 _state.value = _state.value.copy(
                     loaded = true,
@@ -158,6 +158,30 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         ui = s.ui
     )
 
+    /**
+     * One-time migrations (guarded by the persisted schema version).
+     *
+     * v1: the 1.0.0 default resolution was a literal landscape 4:3, which
+     * shows as a strip in a portrait viewfinder. Installs that never touched
+     * the resolution (ratio 4:3, k = 0, locked — impossible to produce by
+     * user interaction, since any ratio tap or slider move writes an
+     * explicit k) move to the new portrait 3:4 default. Anything the user
+     * actually chose is left exactly as stored.
+     */
+    private fun migrate(p: PersistedState): PersistedState {
+        var s = p
+        if (s.version < 1) {
+            val untouchedOldDefault = !s.resolution.unlocked &&
+                s.resolution.k <= 0 &&
+                s.resolution.ratio == Ratio.FOUR_THREE
+            if (untouchedOldDefault) {
+                s = s.copy(resolution = ResolutionSpec(ratio = Ratio.THREE_FOUR))
+            }
+            s = s.copy(version = 1)
+        }
+        return s
+    }
+
     // ------------------------------------------------------- pipe plumbing
 
     /** Max output box (upright frame) for the current rotation. */
@@ -176,7 +200,11 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         return if (s.resolution.unlocked) {
             RatioMath.clampFree(s.resolution.unlockedW, s.resolution.unlockedH, max.w, max.h)
         } else {
-            RatioMath.sizeForClamped(s.resolution.ratio, s.resolution.k, max.w, max.h)
+            // k <= 0 means "device maximum"; sizeForEffective resolves it.
+            // (Regression fix: this used to go through sizeForClamped, which
+            // read k=0 as k=1 and rendered the preview into a 4x3 pixel
+            // frame on a fresh install.)
+            RatioMath.sizeForEffective(s.resolution.ratio, s.resolution.k, max.w, max.h)
         }
     }
 
@@ -284,8 +312,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     fun effectivePresetK(preset: Preset, s: AppState = _state.value): Int {
         val max = uprightMax(s)
-        val k = if (preset.k <= 0) RatioMath.maxK(preset.ratio, max.w, max.h) else preset.k
-        return RatioMath.kClamped(preset.ratio, k, max.w, max.h)
+        return RatioMath.effectiveK(preset.ratio, preset.k, max.w, max.h)
     }
 
     fun isPresetModified(s: AppState = _state.value): Boolean {
@@ -293,18 +320,19 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         if (s.params != preset.params) return true
         if (s.resolution.unlocked) return true
         if (s.resolution.ratio != preset.ratio) return true
-        return s.resolution.k != effectivePresetK(preset, s)
+        // Compare EFFECTIVE k values: k <= 0 means "device maximum", so a
+        // stored 0 must equal the preset's own "max" instead of showing a
+        // spurious modified-dot on a fresh install.
+        val max = uprightMax(s)
+        return RatioMath.effectiveK(s.resolution.ratio, s.resolution.k, max.w, max.h) !=
+            RatioMath.effectiveK(preset.ratio, preset.k, max.w, max.h)
     }
 
     fun selectPreset(id: String) {
         val s = _state.value
         val preset = s.presets.firstOrNull { it.id == id } ?: return
         val max = uprightMax(s)
-        val k = RatioMath.kClamped(
-            preset.ratio,
-            if (preset.k <= 0) RatioMath.maxK(preset.ratio, max.w, max.h) else preset.k,
-            max.w, max.h
-        )
+        val k = RatioMath.effectiveK(preset.ratio, preset.k, max.w, max.h)
         _state.update {
             it.copy(
                 activePresetId = id,

@@ -42,6 +42,38 @@ class RatioMathTest {
         assertEquals(Size2(21, 9), RatioMath.sizeFor(Ratio(21, 9), 1))
     }
 
+    // ---- k = 0 means "device maximum" (fresh-install regression) ----
+
+    @Test
+    fun `k of zero resolves to the device maximum, never to the minimum`() {
+        // Fresh install stores ResolutionSpec(ratio = 3:4, k = 0), meaning
+        // "largest size this device supports". Regression: this used to be
+        // read as k = 1, rendering preview AND saved photos into a 3x4 pixel
+        // frame (an "extremely blurred, no image" viewfinder).
+        // Portrait box 1080x1440 with ratio 3:4: k = min(1080/3, 1440/4) = 360.
+        assertEquals(360, RatioMath.effectiveK(Ratio(3, 4), 0, 1080, 1440))
+        assertEquals(Size2(1080, 1440), RatioMath.sizeForEffective(Ratio(3, 4), 0, 1080, 1440))
+
+        // Landscape 4:3 in the same portrait box is width-limited: k = 270
+        // -> 1080x810 (an exact 4:3 multiple, never stretched to fill).
+        assertEquals(270, RatioMath.effectiveK(Ratio(4, 3), 0, 1080, 1440))
+        assertEquals(Size2(1080, 810), RatioMath.sizeForEffective(Ratio(4, 3), 0, 1080, 1440))
+
+        // Negative k is also "device maximum"
+        assertEquals(360, RatioMath.effectiveK(Ratio(3, 4), -1, 1080, 1440))
+
+        // Explicit k still clamps into the box
+        assertEquals(360, RatioMath.effectiveK(Ratio(3, 4), 10_000, 1080, 1440))
+        assertEquals(64, RatioMath.effectiveK(Ratio(3, 4), 64, 1080, 1440))
+
+        // On a 1x1-limited box the "device maximum" is literally 1x1
+        assertEquals(1, RatioMath.effectiveK(Ratio(1, 1), 0, 1, 1))
+        assertEquals(Size2(1, 1), RatioMath.sizeForEffective(Ratio(1, 1), 0, 1, 1))
+
+        // Landscape box (caps not yet known): 1920x1440 with 4:3 -> k = 480
+        assertEquals(Size2(1920, 1440), RatioMath.sizeForEffective(Ratio(4, 3), 0, 1920, 1440))
+    }
+
     // ---- ratio switching never stretches ----
 
     @Test

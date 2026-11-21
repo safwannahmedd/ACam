@@ -54,9 +54,27 @@ object RatioMath {
     fun kClamped(r: Ratio, k: Int, maxW: Int, maxH: Int): Int =
         min(max(k, 1), maxK(r, maxW, maxH))
 
+    /**
+     * The k actually in effect. A stored k <= 0 means "device maximum"
+     * (largest valid k for the device box) — it must NEVER be read as the
+     * literal minimum k=1, or the whole pipeline would render into a 4x3
+     * pixel frame.
+     */
+    fun effectiveK(r: Ratio, k: Int, maxW: Int, maxH: Int): Int =
+        kClamped(r, if (k <= 0) maxK(r, maxW, maxH) else k, maxW, maxH)
+
     /** Size for k, clamped into the device box while staying an exact multiple. */
     fun sizeForClamped(r: Ratio, k: Int, maxW: Int, maxH: Int): Size2 =
         sizeFor(r, kClamped(r, k, maxW, maxH))
+
+    /**
+     * Size for a stored spec value (k <= 0 = device max), always an exact
+     * ratio multiple inside the device box. This is the one resolver used by
+     * the render pipeline, the capture path and the UI so they can never
+     * disagree.
+     */
+    fun sizeForEffective(r: Ratio, k: Int, maxW: Int, maxH: Int): Size2 =
+        sizeFor(r, effectiveK(r, k, maxW, maxH))
 
     /**
      * Ratio switch without stretching: keep the current height approximately

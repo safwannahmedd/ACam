@@ -110,10 +110,13 @@ data class DateStampConfig(
 /**
  * Resolution selection. In locked mode the size is always an exact integer
  * multiple of the ratio: W = k*a, H = k*b. [k] <= 0 means "device maximum".
+ *
+ * The default is portrait 3:4 so the viewfinder fills a phone held upright;
+ * ratios here are the literal output shape (4:3 = landscape frame).
  */
 @Serializable
 data class ResolutionSpec(
-    val ratio: Ratio = Ratio.FOUR_THREE,
+    val ratio: Ratio = Ratio.THREE_FOUR,
     val k: Int = 0,
     val unlocked: Boolean = false,
     val unlockedW: Int = 0,
