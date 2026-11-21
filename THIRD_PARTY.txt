@@ -1,0 +1,43 @@
+THIRD-PARTY NOTICES
+===================
+
+ACam adapts patterns and assets from the following open-source projects.
+Full license texts are referenced; each project retains its copyright.
+
+1. android/camera-samples (https://github.com/android/camera-samples)
+   Copyright (C) The Android Open Source Project.
+   License: Apache License 2.0
+   Use: CameraX binding, permission handling and SurfaceProvider patterns
+   adapted from the CameraXBasic sample.
+
+2. google/grafika (https://github.com/google/grafika)
+   Copyright (C) The Android Open Source Project.
+   License: Apache License 2.0
+   Use: EGL surface management and MediaCodec input-surface recording
+   patterns (reimplemented in a minimal form in gl/EglSurface13.kt and
+   gl/FrameRecorder.kt).
+
+3. cats-oss/android-gpuimage (https://github.com/cats-oss/android-gpuimage)
+   Copyright (C) CyberAgent, Inc.
+   License: Apache License 2.0
+   Use: reference for classic filter formulations (vignette, sepia,
+   sharpening). No source code copied.
+
+4. Google Material Symbols / material-design-icons
+   (https://github.com/google/material-design-icons)
+   Copyright (C) Google LLC.
+   License: Apache License 2.0
+   Use: all app icons. The official SVG path data is imported verbatim into
+   Android vector drawables under res/drawable/ic_*.xml (outlined style,
+   weight 400). Each file records its source symbol name.
+
+5. Inter (https://github.com/rsms/inter)
+   Copyright (c) 2016-2020 The Inter Project Authors
+   (https://github.com/rsms/inter), with Reserved File Name "Inter".
+   License: SIL Open Font License 1.1
+   Use: app typography (bundled static instances generated from the
+   variable font) and the typographic "A" launcher mark.
+
+6. AndroidX, Jetpack Compose, CameraX, DataStore, kotlinx.serialization
+   Copyright (C) The Android Open Source Project / JetBrains.
+   License: Apache License 2.0
