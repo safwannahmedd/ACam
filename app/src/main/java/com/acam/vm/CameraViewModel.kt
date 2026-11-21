@@ -82,6 +82,11 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val persisted = migrate(repo.state.first())
             if (!_state.value.loaded) {
+                // Zoom never survives a restart: a pinch that ran to the
+                // device maximum would otherwise pin the viewfinder at
+                // extreme digital zoom on every subsequent launch (the
+                // "preview looks extremely zoomed / blurry" report).
+                val safeCamera = persisted.camera.copy(zoom = 1f)
                 _state.value = _state.value.copy(
                     loaded = true,
                     presets = BuiltInPresets.ALL + persisted.customPresets,
@@ -90,7 +95,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                     dateStamp = persisted.dateStamp,
                     resolution = persisted.resolution,
                     video = persisted.video,
-                    cameraPrefs = persisted.camera,
+                    cameraPrefs = safeCamera,
                     ui = persisted.ui
                 )
                 pushPipeConfig()
@@ -222,7 +227,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         val s = _state.value
         val size = resolvedSize(s)
         val mirror = (s.caps?.isFront == true) && s.cameraPrefs.mirrorFront
-        pipe.config.set(
+        pipe.setConfig(
             PipeConfig(
                 params = s.params,
                 outW = size.w,
@@ -305,7 +310,12 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     fun selectLens(index: Int) {
         controller?.selectLens(index)
-        _state.update { it.copy(activeLens = index) }
+        // Lenses never share zoom state: switching resets to 1x so the
+        // viewfinder can never come back pinned at extreme zoom.
+        _state.update {
+            it.copy(activeLens = index, cameraPrefs = it.cameraPrefs.copy(zoom = 1f))
+        }
+        controller?.applyPrefs(_state.value.cameraPrefs)
     }
 
     fun switchCamera() {
@@ -554,6 +564,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             viewModelScope.launch {
                 for (t in timer downTo 1) {
                     _state.update { it.copy(countdown = t) }
+                    if (s.ui.countdownBeep) playCountdownBeep(final = t == 1)
                     delay(1000)
                 }
                 _state.update { it.copy(countdown = null) }
@@ -561,6 +572,22 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             }
         } else {
             doCapture()
+        }
+    }
+
+    /** Short countdown blips (and a longer final beep), like a real
+     *  self-timer. Uses ToneGenerator; no extra permission needed. */
+    private fun playCountdownBeep(final: Boolean) {
+        runCatching {
+            val tone = android.media.ToneGenerator(android.media.AudioManager.STREAM_NOTIFICATION, 70)
+            if (final) {
+                tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP2, 240)
+            } else {
+                tone.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 110)
+            }
+            android.os.Handler(getApplication<Application>().mainLooper).postDelayed({
+                runCatching { tone.release() }
+            }, if (final) 350 else 200)
         }
     }
 
@@ -723,6 +750,13 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     fun setZoom(ratio: Float) {
         val max = _state.value.caps?.maxZoom ?: 1f
         updateCameraPrefs { it.copy(zoom = ratio.coerceIn(1f, max)) }
+    }
+
+    /** One-tap zoom reset (zoom HUD chip / double-tap on the viewfinder). */
+    fun resetZoom() {
+        if (_state.value.cameraPrefs.zoom != 1f) {
+            updateCameraPrefs { it.copy(zoom = 1f) }
+        }
     }
 
     override fun onCleared() {

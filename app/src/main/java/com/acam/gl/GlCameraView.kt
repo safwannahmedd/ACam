@@ -106,6 +106,14 @@ class GlPipe(private val appContext: Context) {
         view?.requestRender()
     }
 
+    /** Update the pipeline config and immediately request a render, so
+     *  ratio / effect / mirror changes are visible even before the next
+     *  camera frame arrives. */
+    fun setConfig(cfg: PipeConfig) {
+        config.set(cfg)
+        view?.requestRender()
+    }
+
     /**
      * Called by the ImageAnalysis analyzer thread for every new frame.
      * O(1): swaps the single pending slot (closing any frame the GL thread
@@ -176,6 +184,16 @@ class GlPipe(private val appContext: Context) {
         private var surfaceW = 1
         private var surfaceH = 1
 
+        // ---- pre-allocated per-frame matrices (no allocations in the hot
+        //      path; see the project's "no per-frame allocation" rule) ----
+        private val uvMat = FloatArray(16)
+        private val uvMat2 = FloatArray(16)
+        private val uvTmp = FloatArray(16)
+        private val rotMat = FloatArray(16)
+        private val cropMat = FloatArray(16)
+        private val mirrorMat = FloatArray(16)
+        private val screenPos = FloatArray(16)
+
         private var capturePending = false
 
         // Recording state (GL thread only)
@@ -213,8 +231,8 @@ class GlPipe(private val appContext: Context) {
         }
 
         override fun onSurfaceChanged(gl: javax.microedition.khronos.opengles.GL10?, width: Int, height: Int) {
-            surfaceW = width
-            surfaceH = height
+            surfaceW = max(width, 1)
+            surfaceH = max(height, 1)
         }
 
         override fun onDrawFrame(gl: javax.microedition.khronos.opengles.GL10?) {
@@ -256,11 +274,27 @@ class GlPipe(private val appContext: Context) {
             // Identical chain to the offline photo render (the texture
             // rows are top-down in both cases), which is what makes the
             // viewfinder literally the saved photo.
+            //
+            // THE ROTATION DIRECTION IS THE INVERSE OF THE IMAGE-SPACE
+            // ROTATION: SENSOR_ORIENTATION says "rotate the buffer
+            // clockwise by this angle to be upright", and a clockwise
+            // image rotation is a counter-clockwise UV rotation, so the
+            // matrix gets (360 - rot). Getting this wrong mirrors the
+            // frame about its diagonal (the old "lines / garbage
+            // viewfinder" bug).
             val rot = ((cfg.sensorOrientation - cfg.displayRotation) % 360 + 360) % 360
             val (csx, csy) = Framing.cropScale(streamW, streamH, rot, cfg.outW, cfg.outH)
-            var uvMat = Mat4.mul(Mat4.flipY(), Mat4.rotation(rot))
-            uvMat = Mat4.mul(uvMat, Mat4.crop(csx, csy))
-            if (cfg.mirror) uvMat = Mat4.mul(uvMat, Mat4.mirror())
+            System.arraycopy(Mat4.rotation((360 - rot) % 360), 0, rotMat, 0, 16)
+            System.arraycopy(Mat4.crop(csx, csy), 0, cropMat, 0, 16)
+            if (cfg.mirror) {
+                System.arraycopy(Mat4.mirror(), 0, mirrorMat, 0, 16)
+                Mat4.mulInto(uvTmp, cropMat, mirrorMat)          // C * M
+                Mat4.mulInto(uvMat2, rotMat, uvTmp)              // R * C * M
+                Mat4.mulInto(uvMat, Mat4.flipY(), uvMat2)        // F * R * C * M
+            } else {
+                Mat4.mulInto(uvTmp, rotMat, cropMat)             // R * C
+                Mat4.mulInto(uvMat, Mat4.flipY(), uvTmp)         // F * R * C
+            }
 
             // ---- choose effect target size ----
             val exact = capturePending || recorder != null ||
@@ -322,14 +356,14 @@ class GlPipe(private val appContext: Context) {
                 sy = 1f
                 sx = fa / va
             }
-            val pos = floatArrayOf(
-                sx, 0f, 0f, 0f,
-                0f, sy, 0f, 0f,
-                0f, 0f, 1f, 0f,
-                0f, 0f, 0f, 1f
-            )
+            screenPos[0] = sx; screenPos[5] = sy
+            screenPos[10] = 1f; screenPos[15] = 1f
+            screenPos[1] = 0f; screenPos[2] = 0f; screenPos[3] = 0f
+            screenPos[4] = 0f; screenPos[6] = 0f; screenPos[7] = 0f
+            screenPos[8] = 0f; screenPos[9] = 0f; screenPos[11] = 0f
+            screenPos[12] = 0f; screenPos[13] = 0f; screenPos[14] = 0f
             blit.use()
-            blit.draw(quad, fbo.tex, pos)
+            blit.draw(quad, fbo.tex, screenPos)
 
             // ---- photo capture ----
             // Done AFTER the screen blit: re-render the effects pass with a
@@ -598,7 +632,10 @@ class GlPipe(private val appContext: Context) {
 
                 val rot = ((rotationDeg % 360) + 360) % 360
                 val (csx, csy) = Framing.cropScale(bw, bh, rot, outW, outH)
-                var uvMat = Mat4.mul(Mat4.flipY(), Mat4.rotation(rot))
+                // Same chain AND same rotation direction as the live pass
+                // (see the long comment in onDrawFrame): R gets the inverse
+                // of the image-space rotation.
+                var uvMat = Mat4.mul(Mat4.flipY(), Mat4.rotation((360 - rot) % 360))
                 uvMat = Mat4.mul(uvMat, Mat4.crop(csx, csy))
                 if (cfg.mirror) uvMat = Mat4.mul(uvMat, Mat4.mirror())
 

@@ -122,12 +122,22 @@ object GlUtils {
  *
  *   vUV = FLIP_Y * R * C * M * uv
  *
- * applied in this order to a target-space (upright, top-left origin) uv:
+ * applied in this order to a target-space uv (GL-natural: origin at the
+ * BOTTOM-left, v grows upward - this is what makes the capture readback
+ * and the on-screen blit both come out upright without extra flips):
  *   M = optional horizontal mirror (front camera)
  *   C = center-crop to the target ratio, computed in UPRIGHT space
  *   R = rotate upright -> sensor/stream orientation
- *   FLIP_Y = row order of the uploaded textures (row 0 lands at v = 0,
- *          true for both GLUtils bitmap uploads and YUV plane uploads)
+ *   FLIP_Y = row order of the uploaded textures (row 0 of the bitmap /
+ *          YUV plane lands at v = 0, i.e. the buffer's TOP row)
+ *
+ * IMPORTANT - rotation direction: R rotates in UV space, which is the
+ * INVERSE of the image-space rotation. SENSOR_ORIENTATION means "rotate
+ * the buffer clockwise by that angle to be upright" (image space), so the
+ * UV-space rotation must be R((360 - rot) % 360). Using R(rot) renders the
+ * frame diagonally mirrored / 180 degrees off on the two portrait cases
+ * (rot = 90 and 270) - the long-standing "viewfinder shows lines / garbage"
+ * bug. Verified against corner-derived ground truth for all four angles.
  *
  * Getting this order right is what guarantees "circles stay circles" and
  * "same field of view at every resolution". The live viewfinder and the
@@ -158,6 +168,19 @@ object Mat4 {
         return r
     }
 
+    /** Allocation-free r = a * b into a pre-owned destination. */
+    fun mulInto(r: FloatArray, a: FloatArray, b: FloatArray) {
+        for (i in 0..3) {
+            for (j in 0..3) {
+                var s = 0f
+                for (k in 0..3) {
+                    s += a[k * 4 + j] * b[i * 4 + k]
+                }
+                r[i * 4 + j] = s
+            }
+        }
+    }
+
     /** Mirror: x -> 1 - x. */
     fun mirror(): FloatArray = floatArrayOf(
         -1f, 0f, 0f, 0f,
@@ -184,7 +207,10 @@ object Mat4 {
         0.5f * (1f - csx), 0.5f * (1f - csy), 0f, 1f
     )
 
-    /** Upright -> stream rotation. rot must be 0/90/180/270. */
+    /** Upright -> stream rotation in UV space. deg must be 0/90/180/270.
+     *  NOTE: the pipeline always passes (360 - rot) here, because a
+     *  clockwise image-space rotation is a counter-clockwise UV-space
+     *  rotation (see the object docs). */
     fun rotation(deg: Int): FloatArray = when (((deg % 360) + 360) % 360) {
         // x' = y,        y' = 1 - x
         90 -> floatArrayOf(

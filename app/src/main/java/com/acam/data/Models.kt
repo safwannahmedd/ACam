@@ -124,7 +124,7 @@ data class ResolutionSpec(
 )
 
 @Serializable
-enum class FlashMode { OFF, ON, AUTO }
+enum class FlashMode { OFF, ON, AUTO, TORCH }
 
 @Serializable
 enum class GridMode { OFF, THIRDS, SQUARE }
@@ -174,7 +174,9 @@ data class UiPrefs(
     val shutterSound: Boolean = false,
     val volumeKeyShutter: Boolean = true,
     val photoFormat: PhotoFormat = PhotoFormat.JPEG,
-    val jpegQuality: Int = 92
+    val jpegQuality: Int = 92,
+    val countdownBeep: Boolean = true,
+    val showResBadge: Boolean = true
 )
 
 /**

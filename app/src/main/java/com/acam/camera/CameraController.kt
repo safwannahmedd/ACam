@@ -94,6 +94,10 @@ class CameraController(
     /** Latest user preferences, supplied by the view model. */
     var prefsProvider: () -> CameraPrefs = { CameraPrefs() }
 
+    /** Video stabilization preference, supplied by the view model so it
+     *  survives process death together with the rest of the settings. */
+    var stabilizationProvider: () -> Boolean = { false }
+
     var onEntriesChanged: ((List<LensEntry>, Int) -> Unit)? = null
     var onCapsChanged: ((Caps?) -> Unit)? = null
     var onError: ((String) -> Unit)? = null
@@ -186,13 +190,14 @@ class CameraController(
             // is the camera output every HAL implements correctly at
             // preview rates (the same path every scanner / CV app uses);
             // the PRIVATE preview stream this device class breaks is not
-            // used at all. A 4:3 1440x1080-class analysis stream keeps the
-            // viewfinder field of view identical to the 4:3 JPEG stills.
+            // used at all. A 4:3 1280x960-class analysis stream keeps the
+            // viewfinder field of view identical to the 4:3 JPEG stills
+            // (both center-crop the same 4:3 sensor frame).
             val analysisSelector = ResolutionSelector.Builder()
                 .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
                 .setResolutionStrategy(
                     ResolutionStrategy(
-                        Size(1440, 1080),
+                        Size(1280, 960),
                         ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
                     )
                 )
@@ -406,7 +411,8 @@ class CameraController(
         }
 
         // ---- Video stabilization ----
-        if (stabilizationWanted && caps.videoStab) {
+        val stab = stabilizationProvider()
+        if (stab && caps.videoStab) {
             builder.setCaptureRequestOption(
                 CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
                 CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
@@ -416,7 +422,7 @@ class CameraController(
         Camera2CameraControl.from(camera.cameraControl).setCaptureRequestOptions(builder.build())
 
         camera.cameraControl.setZoomRatio(prefs.zoom.coerceIn(1f, caps.maxZoom))
-        camera.cameraControl.enableTorch(captureFlash || torchOn)
+        camera.cameraControl.enableTorch(captureFlash || torchOn || prefs.flashMode == com.acam.data.FlashMode.TORCH)
     }
 
     @Volatile var torchOn: Boolean = false
@@ -437,9 +443,12 @@ class CameraController(
         camera.cameraControl.startFocusAndMetering(action)
     }
 
+    /** Momentary capture flash. Never turns the LED off while the torch
+     *  mode is active, and always restores the torch state afterwards. */
     fun startCaptureFlash(on: Boolean) {
         captureFlash = on
-        camera?.cameraControl?.enableTorch(on)
+        val torchActive = torchOn || prefsProvider().flashMode == com.acam.data.FlashMode.TORCH
+        camera?.cameraControl?.enableTorch(on || torchActive)
     }
 
     /**

@@ -114,7 +114,7 @@ fun LevelIndicator(enabled: Boolean) {
     }
     val level = abs(roll) < 1.5f
     Text(
-        text = if (level) "--" else String.format(Locale.US, "%.1f", roll),
+        text = if (level) "level" else String.format(Locale.US, "%.1f°", roll),
         color = if (level) Color(0xFFE8590C) else Color.White.copy(alpha = 0.5f),
         fontSize = 11.sp,
         fontWeight = FontWeight.Medium,

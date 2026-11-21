@@ -79,9 +79,18 @@ fun SettingsScreen(vm: CameraViewModel, onBack: () -> Unit) {
             ToggleRow("Shutter sound", state.ui.shutterSound) { on ->
                 vm.updateUi { it.copy(shutterSound = on) }
             }
+            ToggleRow("Self-timer beeps", state.ui.countdownBeep) { on ->
+                vm.updateUi { it.copy(countdownBeep = on) }
+            }
             ToggleRow("Volume button shutter", state.ui.volumeKeyShutter) { on ->
                 vm.updateUi { it.copy(volumeKeyShutter = on) }
             }
+
+            SectionHeader("Viewfinder")
+            ToggleRow("Show resolution badge", state.ui.showResBadge) { on ->
+                vm.updateUi { it.copy(showResBadge = on) }
+            }
+            com.acam.ui.components.Hint("The badge in the top-left corner of the viewfinder showing the current output size.")
 
             SectionHeader("Photos")
             Segmented(
@@ -106,7 +115,7 @@ fun SettingsScreen(vm: CameraViewModel, onBack: () -> Unit) {
 
             SectionHeader("About")
             Text(
-                text = "ACam 1.0",
+                text = "ACam 1.1",
                 style = MaterialTheme.typography.titleMedium
             )
             Spacer(Modifier.height(6.dp))

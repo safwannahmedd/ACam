@@ -204,6 +204,75 @@ class RatioMathTest {
     }
 
     @Test
+    fun `rot 90 top of the frame comes from the left of the stream`() {
+        // Corner-derived ground truth: rotating the sensor buffer clockwise
+        // by 90 makes the buffer's LEFT edge the top of the upright image.
+        val rot = 90
+        val (csx, csy) = Framing.cropScale(4000, 3000, rot, 1000, 1000)
+        // View 1080x1920 with a 1:1 frame: frame occupies y in [420, 1500].
+        // Tap just inside the TOP-center of the visible frame.
+        val top = Framing.viewToStream(
+            540f, 421f, 1080f, 1920f, 1000f, 1000f, rot, false, csx, csy
+        )!!
+        // Stream s must be near 0 (left edge); crop=1.0/0.75 puts the
+        // sampled band at s in [0.125, 0.875] with the top at s ~ 0.125.
+        assertEquals(0.125, top.first.toDouble(), 0.01)
+        assertEquals(0.5, top.second.toDouble(), 0.05)
+        // Tap just inside the BOTTOM-center: comes from the RIGHT edge.
+        val bottom = Framing.viewToStream(
+            540f, 1499f, 1080f, 1920f, 1000f, 1000f, rot, false, csx, csy
+        )!!
+        assertEquals(0.875, bottom.first.toDouble(), 0.01)
+        assertEquals(0.5, bottom.second.toDouble(), 0.05)
+    }
+
+    @Test
+    fun `taps at every frame corner stay inside the cropped stream`() {
+        // Regression: the old un-crop divided instead of multiplying, so
+        // taps near any frame edge returned null whenever a crop was active
+        // (e.g. a 1:1 target from a 4:3 stream) - dead tap-to-focus zones.
+        for (rot in intArrayOf(0, 90, 180, 270)) {
+            val (csx, csy) = Framing.cropScale(4000, 3000, rot, 1000, 1000)
+            for ((x, y) in listOf(
+                540f to 421f, 1075f to 421f, 540f to 1499f, 1075f to 1499f
+            )) {
+                val r = Framing.viewToStream(
+                    x, y, 1080f, 1920f, 1000f, 1000f, rot, false, csx, csy
+                )
+                assertTrue("rot=$rot tap=($x,$y) must be focusable", r != null)
+                assertTrue(r!!.first in 0f..1f && r.second in 0f..1f)
+                // And the round trip returns into the frame.
+                val back = Framing.streamToTarget(r.first, r.second, rot, false, csx, csy)
+                assertTrue(back.first in 0f..1f && back.second in 0f..1f)
+            }
+        }
+    }
+
+    @Test
+    fun `round trip is identity for all rotations with and without crop`() {
+        for (rot in intArrayOf(0, 90, 180, 270)) {
+            for (crop in listOf(1f to 1f, 1f to 0.75f, 0.75f to 1f)) {
+                for (mirror in listOf(false, true)) {
+                    for ((u, ty) in listOf(0.2f to 0.3f, 0.8f to 0.25f, 0.35f to 0.85f, 0.9f to 0.9f)) {
+                        // Build a tap position from the target uv directly:
+                        // view 1000x1000, frame fills it.
+                        val s = Framing.viewToStream(
+                            u * 1000f, ty * 1000f, 1000f, 1000f, 1000f, 1000f,
+                            rot, mirror, crop.first, crop.second
+                        )!!
+                        val back = Framing.streamToTarget(
+                            s.first, s.second, rot, mirror, crop.first, crop.second
+                        )
+                        assertEquals("rot=$rot crop=$crop mirror=$mirror u=$u",
+                            u.toDouble(), back.first.toDouble(), 0.01)
+                        assertEquals(ty.toDouble(), back.second.toDouble(), 0.01)
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
     fun `mirror flips the horizontal axis only`() {
         val rot = 0
         val (csx, csy) = Framing.cropScale(4000, 3000, rot, 4000, 3000)

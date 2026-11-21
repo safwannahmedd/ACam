@@ -35,6 +35,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.acam.camera.CameraController
 import com.acam.data.ThemeMode
@@ -72,6 +74,9 @@ class MainActivity : ComponentActivity() {
         controller = CameraController(this, this, vm.pipe)
         vm.controller = controller
         controller.prefsProvider = { vm.state.value.cameraPrefs }
+        // Stabilization lives with the video settings and is re-applied
+        // from them on every bind, so it survives restarts.
+        controller.stabilizationProvider = { vm.state.value.video.stabilization }
         controller.onCapsChanged = { caps -> vm.onCaps(caps) }
         controller.onEntriesChanged = { entries, active -> vm.onLensEntries(entries, active) }
         controller.onError = { msg -> android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show() }
@@ -109,17 +114,32 @@ class MainActivity : ComponentActivity() {
                 ) {
                     when {
                         !cameraGranted -> PermissionScreen { requestCamera.launch(Manifest.permission.CAMERA) }
-                        screen == Screen.Camera -> CameraScreen(
-                            vm = vm,
-                            onOpenSettings = {
-                                if (state.video.audio) {
-                                    maybeRequestMic()
+                        else -> {
+                            // The camera screen stays composed at all times;
+                            // Settings is drawn ON TOP of it. The viewfinder
+                            // therefore keeps running (and the GL view is
+                            // never torn down) while settings are open.
+                            Box(modifier = Modifier.fillMaxSize()) {
+                                CameraScreen(
+                                    vm = vm,
+                                    onOpenSettings = {
+                                        if (state.video.audio) {
+                                            maybeRequestMic()
+                                        }
+                                        screen = Screen.Settings
+                                    }
+                                )
+                                if (screen == Screen.Settings) {
+                                    Surface(
+                                        modifier = Modifier.fillMaxSize(),
+                                        color = MaterialTheme.colorScheme.background
+                                    ) {
+                                        SettingsScreen(vm) {
+                                            screen = Screen.Camera
+                                        }
+                                    }
                                 }
-                                screen = Screen.Settings
                             }
-                        )
-                        else -> SettingsScreen(vm) {
-                            screen = Screen.Camera
                         }
                     }
                 }

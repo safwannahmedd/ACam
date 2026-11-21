@@ -43,6 +43,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.ScrollState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -77,12 +79,26 @@ private val ChromeDim = Color(0xB3F2F2F2)
 private val AccentOrange = Color(0xFFE8590C)
 private val RecRed = Color(0xFFFF5C5C)
 
+/**
+ * Hoisted Adjust-sheet UI state (selected tabs + one scroll position per
+ * tab). Living at the CameraScreen level - OUTSIDE the
+ * "if (adjustOpen)" conditional - is what makes the sheet remember where
+ * you were after closing and reopening it (the old sheet reset to the top
+ * every time).
+ */
+class SheetUiState {
+    val mainTab = androidx.compose.runtime.mutableIntStateOf(0)
+    val lookTab = androidx.compose.runtime.mutableIntStateOf(0)
+    val scrolls = List(9) { ScrollState(0) }
+}
+
 @Composable
 fun CameraScreen(vm: CameraViewModel, onOpenSettings: () -> Unit) {
     val state by vm.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val view = LocalView.current
     val clipboard = LocalClipboardManager.current
+    val sheet = remember { SheetUiState() }
 
     var focusPoint by remember { mutableStateOf<Offset?>(null) }
     var presetMenuOpen by remember { mutableStateOf(false) }
@@ -115,6 +131,12 @@ fun CameraScreen(vm: CameraViewModel, onOpenSettings: () -> Unit) {
                         onTap = { off ->
                             vm.focusAt(off.x, off.y, size.width.toFloat(), size.height.toFloat())
                             focusPoint = off
+                        },
+                        onDoubleTap = {
+                            // Double-tap always resets zoom - a run-away
+                            // pinch can never trap the viewfinder.
+                            view.performHapticFeedback(android.view.HapticFeedbackConstants.CONTEXT_CLICK)
+                            vm.resetZoom()
                         }
                     )
                 }
@@ -145,12 +167,15 @@ fun CameraScreen(vm: CameraViewModel, onOpenSettings: () -> Unit) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             TopIcon(flashIcon(state.cameraPrefs.flashMode), "Flash") {
-                val order = listOf(FlashMode.OFF, FlashMode.AUTO, FlashMode.ON)
+                val order = if (state.caps?.hasFlash == true)
+                    listOf(FlashMode.OFF, FlashMode.AUTO, FlashMode.ON, FlashMode.TORCH)
+                else
+                    listOf(FlashMode.OFF, FlashMode.AUTO, FlashMode.ON)
                 val next = order[(order.indexOf(state.cameraPrefs.flashMode) + 1) % order.size]
                 vm.updateCameraPrefs { it.copy(flashMode = next) }
             }
             TopIcon(R.drawable.ic_timer, "Self-timer") {
-                val order = listOf(0, 3, 10)
+                val order = listOf(0, 3, 5, 10)
                 val next = order[(order.indexOf(state.cameraPrefs.timer) + 1) % order.size]
                 vm.updateCameraPrefs { it.copy(timer = next) }
             }
@@ -176,25 +201,51 @@ fun CameraScreen(vm: CameraViewModel, onOpenSettings: () -> Unit) {
         }
 
         // ---------------- resolution badge ----------------
-        val size = remember(state.resolution, state.caps, state.displayRotation) {
-            vm.resolvedSize()
+        if (state.ui.showResBadge) {
+            val size = remember(state.resolution, state.caps, state.displayRotation) {
+                vm.resolvedSize()
+            }
+            Column(
+                modifier = Modifier
+                    .statusBarsPadding()
+                    .padding(top = 52.dp, start = 14.dp)
+            ) {
+                Text(
+                    text = "${size.w} x ${size.h}",
+                    color = ChromeDim,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    text = RatioMath.megapixelsLabel(size.w, size.h),
+                    color = ChromeDim.copy(alpha = 0.6f),
+                    fontSize = 10.sp
+                )
+            }
         }
-        Column(
-            modifier = Modifier
-                .statusBarsPadding()
-                .padding(top = 52.dp, start = 14.dp)
-        ) {
-            Text(
-                text = "${size.w} x ${size.h}",
-                color = ChromeDim,
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Medium
-            )
-            Text(
-                text = RatioMath.megapixelsLabel(size.w, size.h),
-                color = ChromeDim.copy(alpha = 0.6f),
-                fontSize = 10.sp
-            )
+
+        // ---------------- zoom HUD ----------------
+        // Always visible while zoomed; tap to jump back to 1x.
+        if (state.cameraPrefs.zoom > 1.01f) {
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = Color.Black.copy(alpha = 0.55f),
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 10.dp)
+                    .clickable {
+                        view.performHapticFeedback(android.view.HapticFeedbackConstants.CONTEXT_CLICK)
+                        vm.resetZoom()
+                    }
+            ) {
+                Text(
+                    text = String.format(java.util.Locale.US, "%.1fx", state.cameraPrefs.zoom),
+                    color = ChromeOn,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp)
+                )
+            }
         }
 
         // ---------------- recording badge ----------------
@@ -402,7 +453,7 @@ fun CameraScreen(vm: CameraViewModel, onOpenSettings: () -> Unit) {
 
     // ---------------- dialogs ----------------
     if (state.adjustOpen) {
-        AdjustSheet(vm)
+        AdjustSheet(vm, sheet)
     }
 
     if (exportOpen) {
@@ -596,6 +647,7 @@ private fun flashIcon(mode: FlashMode): Int = when (mode) {
     FlashMode.OFF -> R.drawable.ic_flash_off
     FlashMode.AUTO -> R.drawable.ic_flash_auto
     FlashMode.ON -> R.drawable.ic_flash_on
+    FlashMode.TORCH -> R.drawable.ic_flashlight_on
 }
 
 private fun gridIcon(mode: GridMode): Int = when (mode) {

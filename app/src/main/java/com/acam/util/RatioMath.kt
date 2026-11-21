@@ -208,12 +208,15 @@ object Framing {
 
     /**
      * Map a view tap (view pixels, top-left origin) to stream pixels
-     * (sensor-oriented, which is what CameraX metering expects).
+     * (sensor-oriented buffer, (0,0) = top-left of the buffer, which is
+     * what CameraX metering expects).
      * Returns null when the tap is outside the letterboxed frame.
      *
-     * Forward map (renderer): target uv -> mirror -> center-crop (in upright
-     * space) -> rotate to stream orientation -> stream uv. This is the
-     * exact inverse.
+     * This is the EXACT inverse of the renderer's UV chain
+     * FLIP_Y * R((360-rot)%360) * C * M applied to GL-natural target uv
+     * (v = 0 = image bottom), derived corner by corner and locked in by
+     * the unit tests. See Mat4's docs for why the rotation direction is
+     * inverted versus the image-space rotation.
      */
     fun viewToStream(
         x: Float, y: Float, viewW: Float, viewH: Float,
@@ -237,45 +240,46 @@ object Framing {
         val ox = (viewW - cw) / 2f
         val oy = (viewH - ch) / 2f
         if (x < ox || x > ox + cw || y < oy || y > oy + ch) return null
-        var tx = (x - ox) / cw
-        val ty = (y - oy) / ch
-        if (mirror) tx = 1f - tx
-        // Un-crop in upright space.
-        val ux = (tx - 0.5f) / cropX + 0.5f
-        val uy = (ty - 0.5f) / cropY + 0.5f
-        if (ux < 0f || ux > 1f || uy < 0f || uy > 1f) return null
-        // Rotate upright -> stream (forward rotation).
+        val u = (x - ox) / cw               // target x, left..right
+        val ty = (y - oy) / ch              // target y, top..bottom
+        val v = 1f - ty                     // GL-natural: v = 0 at bottom
+        val mu = if (mirror) 1f - u else u
+        // Crop: target uv -> full-upright uv (the same forward crop the
+        // shader applies when sampling; cs < 1 narrows the sampled region).
+        val xc = (mu - 0.5f) * cropX + 0.5f
+        val yc = (v - 0.5f) * cropY + 0.5f
+        if (xc < 0f || xc > 1f || yc < 0f || yc > 1f) return null
+        // Rotate upright -> stream, then account for the top-down texture
+        // rows (the renderer's FLIP_Y).
         val rot = ((rotationDeg % 360) + 360) % 360
         return when (rot) {
-            90 -> uy to (1f - ux)
-            180 -> (1f - ux) to (1f - uy)
-            270 -> (1f - uy) to ux
-            else -> ux to uy
+            0 -> Pair(xc, 1f - yc)
+            90 -> Pair(1f - yc, 1f - xc)
+            180 -> Pair(1f - xc, yc)
+            else -> Pair(yc, xc)          // 270
         }
     }
 
     /**
      * Forward map used by unit tests to verify [viewToStream] against the
-     * exact shader math: target uv -> mirror -> crop -> rotate -> stream uv.
+     * exact shader math: stream uv -> target uv (top-left origin).
      */
     fun streamToTarget(
         sxIn: Float, syIn: Float, rotationDeg: Int, mirror: Boolean,
         cropX: Float, cropY: Float
     ): Pair<Float, Float> {
-        // Inverse rotate: stream -> upright.
         val rot = ((rotationDeg % 360) + 360) % 360
-        val ux: Float
-        val uy: Float
+        val xc: Float
+        val yc: Float
         when (rot) {
-            90 -> { ux = 1f - syIn; uy = sxIn }
-            180 -> { ux = 1f - sxIn; uy = 1f - syIn }
-            270 -> { ux = syIn; uy = 1f - sxIn }
-            else -> { ux = sxIn; uy = syIn }
+            0 -> { xc = sxIn; yc = 1f - syIn }
+            90 -> { xc = 1f - syIn; yc = 1f - sxIn }
+            180 -> { xc = 1f - sxIn; yc = syIn }
+            else -> { xc = syIn; yc = sxIn }   // 270
         }
-        // Crop (upright space).
-        var tx = (ux - 0.5f) * cropX + 0.5f
-        val ty = (uy - 0.5f) * cropY + 0.5f
-        if (mirror) tx = 1f - tx
-        return tx to ty
+        var mu = (xc - 0.5f) / cropX + 0.5f
+        val v = (yc - 0.5f) / cropY + 0.5f
+        if (mirror) mu = 1f - mu
+        return mu to (1f - v)
     }
 }

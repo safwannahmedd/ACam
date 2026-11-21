@@ -11,7 +11,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
@@ -24,19 +23,19 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.acam.data.FlashMode
 import com.acam.data.FocusMode
 import com.acam.data.FrameStyle
 import com.acam.data.GridMode
-import com.acam.data.PhotoFormat
 import com.acam.data.Ratio
+import com.acam.ui.camera.SheetUiState
 import com.acam.util.RatioMath
 import com.acam.vm.CameraViewModel
 import com.acam.ui.components.ConfirmDialog
@@ -50,16 +49,22 @@ import java.util.Locale
 import kotlin.math.ln
 
 /**
- * The partial-height Adjust sheet. It never covers the whole viewfinder:
- * half-expanded by default, drag to expand/dismiss. Every control writes
- * straight into the live pipeline.
+ * The compact Adjust sheet. It never covers the whole viewfinder: the
+ * content area is capped at ~45% of the screen height, half-expanded by
+ * default, drag to expand/dismiss. Every control writes straight into the
+ * live pipeline.
+ *
+ * The selected tabs and every scroll position live in [SheetUiState],
+ * hoisted OUTSIDE this (conditionally composed) sheet, so closing and
+ * reopening the sheet returns you exactly where you were instead of
+ * resetting to the top.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun AdjustSheet(vm: CameraViewModel) {
+fun AdjustSheet(vm: CameraViewModel, sheet: SheetUiState) {
     val state by vm.state.collectAsStateWithLifecycle()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
-    var tab by remember { mutableIntStateOf(0) }
+    val maxH = (LocalConfiguration.current.screenHeightDp * 0.45f).dp.coerceAtLeast(240.dp)
 
     ModalBottomSheet(
         onDismissRequest = { vm.setAdjustOpen(false) },
@@ -67,28 +72,37 @@ fun AdjustSheet(vm: CameraViewModel) {
         containerColor = MaterialTheme.colorScheme.surface,
         tonalElevation = 0.dp
     ) {
-        TabRow(selectedTabIndex = tab) {
-            listOf("LOOK", "RESOLUTION", "CAMERA", "VIDEO").forEachIndexed { i, title ->
-                Tab(
-                    selected = tab == i,
-                    onClick = { tab = i },
-                    text = { Text(title, style = MaterialTheme.typography.labelMedium) }
-                )
+        Column {
+            TabRow(selectedTabIndex = sheet.mainTab.intValue) {
+                listOf("LOOK", "RESOLUTION", "CAMERA", "VIDEO").forEachIndexed { i, title ->
+                    Tab(
+                        selected = sheet.mainTab.intValue == i,
+                        onClick = { sheet.mainTab.intValue = i },
+                        text = { Text(title, style = MaterialTheme.typography.labelMedium) }
+                    )
+                }
             }
-        }
-        Column(
-            modifier = Modifier
-                .heightIn(max = 430.dp)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 18.dp)
-                .navigationBarsPadding()
-                .padding(bottom = 12.dp)
-        ) {
-            when (tab) {
-                0 -> LookTab(vm)
-                1 -> ResolutionTab(vm)
-                2 -> CameraTab(vm)
-                else -> VideoTab(vm)
+            Column(
+                modifier = Modifier
+                    .heightIn(max = maxH)
+                    .verticalScroll(
+                        when (sheet.mainTab.intValue) {
+                            0 -> sheet.scrolls[sheet.lookTab.intValue.coerceIn(0, 4)]
+                            1 -> sheet.scrolls[5]
+                            2 -> sheet.scrolls[6]
+                            else -> sheet.scrolls[7]
+                        }
+                    )
+                    .padding(horizontal = 18.dp)
+                    .navigationBarsPadding()
+                    .padding(bottom = 12.dp)
+            ) {
+                when (sheet.mainTab.intValue) {
+                    0 -> LookTab(vm, sheet)
+                    1 -> ResolutionTab(vm)
+                    2 -> CameraTab(vm)
+                    else -> VideoTab(vm)
+                }
             }
         }
     }
@@ -105,8 +119,13 @@ private class Param(
     val fmt: (Float) -> String = { String.format(Locale.US, "%.2f", it) }
 )
 
+/**
+ * The LOOK tab, split into five short sub-tabs (Color / Tone / Film /
+ * Lens / Retro + frame) so each page shows only a handful of sliders
+ * instead of one endless wall of them.
+ */
 @Composable
-private fun LookTab(vm: CameraViewModel) {
+private fun LookTab(vm: CameraViewModel, sheet: SheetUiState) {
     val state by vm.state.collectAsStateWithLifecycle()
     val defaults = state.activePreset?.params ?: com.acam.data.EffectParams()
 
@@ -132,11 +151,6 @@ private fun LookTab(vm: CameraViewModel) {
         Param("Shadows", -1f, 1f, { it.shadows }, { p, v -> p.copy(shadows = v) }),
         Param("Black point", 0f, 0.5f, { it.blackPoint }, { p, v -> p.copy(blackPoint = v) })
     )
-    val toneParams = listOf(
-        Param("B&W amount", 0f, 1f, { it.bwAmount }, { p, v -> p.copy(bwAmount = v) }),
-        Param("Sepia amount", 0f, 1f, { it.sepiaAmount }, { p, v -> p.copy(sepiaAmount = v) }),
-        Param("Tone curve", 0f, 1f, { it.toneCurve }, { p, v -> p.copy(toneCurve = v) })
-    )
     val mixerParams = listOf(
         Param("Red <- Red", -1f, 2f, { it.mixerRR }, { p, v -> p.copy(mixerRR = v) }),
         Param("Red <- Green", -1f, 1f, { it.mixerRG }, { p, v -> p.copy(mixerRG = v) }),
@@ -147,6 +161,11 @@ private fun LookTab(vm: CameraViewModel) {
         Param("Blue <- Red", -1f, 1f, { it.mixerBR }, { p, v -> p.copy(mixerBR = v) }),
         Param("Blue <- Green", -1f, 1f, { it.mixerBG }, { p, v -> p.copy(mixerBG = v) }),
         Param("Blue <- Blue", -1f, 2f, { it.mixerBB }, { p, v -> p.copy(mixerBB = v) })
+    )
+    val toneParams = listOf(
+        Param("B&W amount", 0f, 1f, { it.bwAmount }, { p, v -> p.copy(bwAmount = v) }),
+        Param("Sepia amount", 0f, 1f, { it.sepiaAmount }, { p, v -> p.copy(sepiaAmount = v) }),
+        Param("Tone curve", 0f, 1f, { it.toneCurve }, { p, v -> p.copy(toneCurve = v) })
     )
     val filmParams = listOf(
         Param("Grain", 0f, 1f, { it.grainAmount }, { p, v -> p.copy(grainAmount = v) }),
@@ -171,73 +190,91 @@ private fun LookTab(vm: CameraViewModel) {
         Param("Dithering", 0f, 1f, { it.dither }, { p, v -> p.copy(dither = v) })
     )
 
-    SectionHeader("Color")
-    colorParams.forEach { slider(it) }
-
-    SectionHeader("Tone")
-    toneParams.forEach { slider(it) }
-
-    SectionHeader("Film")
-    filmParams.forEach { slider(it) }
-    Row(
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier.fillMaxWidth().padding(top = 2.dp)
-    ) {
-        Segmented(
-            options = listOf("Warm edge", "Streak", "Red wash"),
-            selected = state.params.lightLeakType,
-            onSelect = { i -> vm.updateParams { it.copy(lightLeakType = i) } },
-            modifier = Modifier.fillMaxWidth()
-        )
+    TabRow(selectedTabIndex = sheet.lookTab.intValue) {
+        listOf("Color", "Tone", "Film", "Lens", "Retro").forEachIndexed { i, title ->
+            Tab(
+                selected = sheet.lookTab.intValue == i,
+                onClick = { sheet.lookTab.intValue = i },
+                text = { Text(title, style = MaterialTheme.typography.labelMedium) }
+            )
+        }
     }
 
-    SectionHeader("Lens")
-    lensParams.forEach { slider(it) }
-
-    SectionHeader("Retro digital")
-    digitalParams.forEach { slider(it) }
-
-    SectionHeader("Channel mixer")
-    Hint("Output channel gains over input R, G, B.")
-    mixerParams.forEach { slider(it) }
-
-    SectionHeader("Frame & stamp")
-    Segmented(
-        options = listOf("No frame", "Polaroid", "Film strip"),
-        selected = when (state.params.frame) {
-            FrameStyle.NONE -> 0
-            FrameStyle.POLAROID -> 1
-            FrameStyle.FILM_STRIP -> 2
-        },
-        onSelect = { i ->
-            vm.updateParams {
-                it.copy(frame = when (i) {
-                    0 -> FrameStyle.NONE
-                    1 -> FrameStyle.POLAROID
-                    else -> FrameStyle.FILM_STRIP
-                })
+    when (sheet.lookTab.intValue) {
+        0 -> {
+            SectionHeader("Color")
+            colorParams.forEach { slider(it) }
+            SectionHeader("Channel mixer")
+            Hint("Output channel gains over input R, G, B.")
+            mixerParams.forEach { slider(it) }
+        }
+        1 -> {
+            SectionHeader("Tone")
+            toneParams.forEach { slider(it) }
+            Hint("Filmic S-curve, B&W and sepia mix on top of the color section.")
+        }
+        2 -> {
+            SectionHeader("Film")
+            filmParams.forEach { slider(it) }
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth().padding(top = 2.dp)
+            ) {
+                Segmented(
+                    options = listOf("Warm edge", "Streak", "Red wash"),
+                    selected = state.params.lightLeakType,
+                    onSelect = { i -> vm.updateParams { it.copy(lightLeakType = i) } },
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
-        },
-        modifier = Modifier.fillMaxWidth()
-    )
-    ToggleRow(
-        title = "Orange date stamp",
-        checked = state.params.dateStamp,
-        onChange = { on -> vm.updateParams { it.copy(dateStamp = on) } }
-    )
-    if (state.params.dateStamp) {
-        var text by remember(state.dateStamp.text) { mutableStateOf(state.dateStamp.text) }
-        OutlinedTextField(
-            value = text,
-            onValueChange = {
-                text = it
-                vm.updateDateStamp { cfg -> cfg.copy(text = it) }
-            },
-            label = { Text("Stamp text / date pattern") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth()
-        )
-        Hint("Date patterns like 'MMM d, yyyy  h:mm a' are rendered live; any literal text works too.")
+        }
+        3 -> {
+            SectionHeader("Lens")
+            lensParams.forEach { slider(it) }
+        }
+        else -> {
+            SectionHeader("Retro digital")
+            digitalParams.forEach { slider(it) }
+
+            SectionHeader("Frame & stamp")
+            Segmented(
+                options = listOf("No frame", "Polaroid", "Film strip"),
+                selected = when (state.params.frame) {
+                    FrameStyle.NONE -> 0
+                    FrameStyle.POLAROID -> 1
+                    FrameStyle.FILM_STRIP -> 2
+                },
+                onSelect = { i ->
+                    vm.updateParams {
+                        it.copy(frame = when (i) {
+                            0 -> FrameStyle.NONE
+                            1 -> FrameStyle.POLAROID
+                            else -> FrameStyle.FILM_STRIP
+                        })
+                    }
+                },
+                modifier = Modifier.fillMaxWidth()
+            )
+            ToggleRow(
+                title = "Orange date stamp",
+                checked = state.params.dateStamp,
+                onChange = { on -> vm.updateParams { it.copy(dateStamp = on) } }
+            )
+            if (state.params.dateStamp) {
+                var text by remember(state.dateStamp.text) { mutableStateOf(state.dateStamp.text) }
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = {
+                        text = it
+                        vm.updateDateStamp { cfg -> cfg.copy(text = it) }
+                    },
+                    label = { Text("Stamp text / date pattern") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Hint("Date patterns like 'MMM d, yyyy  h:mm a' are rendered live; any literal text works too.")
+            }
+        }
     }
 }
 
@@ -451,14 +488,41 @@ private fun CameraTab(vm: CameraViewModel) {
     if (caps != null && caps.hasFlash) {
         SectionHeader("Flash")
         Segmented(
-            options = listOf("Off", "Auto", "On"),
+            options = listOf("Off", "Auto", "On", "Torch"),
             selected = state.cameraPrefs.flashMode.ordinal,
             onSelect = { i ->
                 vm.updateCameraPrefs { it.copy(flashMode = FlashMode.entries[i]) }
             },
             modifier = Modifier.fillMaxWidth()
         )
+        if (state.cameraPrefs.flashMode == FlashMode.TORCH) {
+            Hint("Torch keeps the LED on continuously - while framing and during captures - until you switch it off.")
+        }
     }
+
+    SectionHeader("Zoom")
+    val maxZoom = caps?.maxZoom ?: 1f
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+        listOf("1x" to 1f, "2x" to 2f, "5x" to 5f).forEach { (label, z) ->
+            RatioChip(
+                label,
+                state.cameraPrefs.zoom == z,
+                { vm.setZoom(z) },
+                Modifier.weight(1f)
+            )
+        }
+    }
+    Spacer(Modifier.height(6.dp))
+    ValueSlider(
+        label = "Zoom",
+        value = state.cameraPrefs.zoom.coerceIn(1f, maxZoom),
+        onValueChange = { v -> vm.updateCameraPrefs { it.copy(zoom = v) } },
+        min = 1f,
+        max = maxZoom,
+        defaultValue = 1f,
+        format = { String.format(Locale.US, "%.1fx", it) }
+    )
+    Hint("Pinch the viewfinder to zoom, double-tap it (or tap the zoom badge) to jump back to 1x.")
 
     SectionHeader("Focus")
     Segmented(
@@ -543,24 +607,12 @@ private fun CameraTab(vm: CameraViewModel) {
         Hint("Manual white balance is not supported; using auto.")
     }
 
-    SectionHeader("Zoom")
-    val maxZoom = caps?.maxZoom ?: 1f
-    ValueSlider(
-        label = "Zoom",
-        value = state.cameraPrefs.zoom.coerceIn(1f, maxZoom),
-        onValueChange = { v -> vm.updateCameraPrefs { it.copy(zoom = v) } },
-        min = 1f,
-        max = maxZoom,
-        defaultValue = 1f,
-        format = { String.format(Locale.US, "%.1fx", it) }
-    )
-
     SectionHeader("Capture aids")
     Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
         Segmented(
-            options = listOf("No timer", "3s", "10s"),
-            selected = listOf(0, 3, 10).indexOf(state.cameraPrefs.timer),
-            onSelect = { i -> vm.updateCameraPrefs { it.copy(timer = listOf(0, 3, 10)[i]) } },
+            options = listOf("Off", "3s", "5s", "10s"),
+            selected = listOf(0, 3, 5, 10).indexOf(state.cameraPrefs.timer),
+            onSelect = { i -> vm.updateCameraPrefs { it.copy(timer = listOf(0, 3, 5, 10)[i]) } },
             modifier = Modifier.weight(1f)
         )
     }
@@ -632,6 +684,7 @@ private fun VideoTab(vm: CameraViewModel) {
             }
         }
     }
+
     var customFps by remember(state.video.fps) { mutableStateOf(state.video.fps.toString()) }
     OutlinedTextField(
         value = customFps,
@@ -688,7 +741,6 @@ private fun VideoTab(vm: CameraViewModel) {
     if (state.caps?.videoStab == true) {
         ToggleRow("Video stabilization", state.video.stabilization) { on ->
             vm.updateVideo { it.copy(stabilization = on) }
-            vm.controller?.stabilizationWanted = on
             vm.controller?.applyPrefs(vm.state.value.cameraPrefs)
         }
     } else {
