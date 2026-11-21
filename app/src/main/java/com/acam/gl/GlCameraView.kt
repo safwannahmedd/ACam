@@ -7,6 +7,7 @@ import android.opengl.EGL14
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
 import android.os.SystemClock
+import android.util.Log
 import com.acam.data.EffectParams
 import com.acam.data.FrameStyle
 import com.acam.util.Framing
@@ -47,6 +48,11 @@ sealed class GlCommand {
     object PauseRecording : GlCommand()
     object ResumeRecording : GlCommand()
     class UpdateStamp(val bitmap: Bitmap?) : GlCommand()
+
+    /** Full-resolution still, decoded from the ImageCapture JPEG, rendered
+     *  through the same effects pipeline as the live preview. The renderer
+     *  recycles the bitmap after uploading it to a GL texture. */
+    class OfflineCapture(val bitmap: Bitmap, val rotationDeg: Int) : GlCommand()
 }
 
 /** Events delivered from the GL thread back to the view model. */
@@ -99,13 +105,25 @@ class GlPipe(private val appContext: Context) {
     inner class Renderer : GLSurfaceView.Renderer {
 
         private var effects: EffectProgram? = null
+        private var effects2D: EffectProgram? = null
         private var blit: BlitProgram? = null
         private var quad: java.nio.FloatBuffer? = null
         private var oesTex = 0
         private var overlayTex = 0
+        private var captureTex = 0
         private var stampBmpW = 1
         private var stampBmpH = 1
         private var mainFbo: GlUtils.Fbo? = null
+        private var offlineFbo: GlUtils.Fbo? = null
+
+        /** Top-down flip for readbacks: renders the quad upside down so
+         *  glReadPixels returns top-down rows with no extra copy. */
+        private val flipPos = floatArrayOf(
+            1f, 0f, 0f, 0f,
+            0f, -1f, 0f, 0f,
+            0f, 0f, 1f, 0f,
+            0f, 0f, 0f, 1f
+        )
 
         private val stMat = FloatArray(16)
         private val identity = Mat4.identity()
@@ -263,18 +281,12 @@ class GlPipe(private val appContext: Context) {
                 capturePending = false
                 fbo.bind()
                 GLES20.glViewport(0, 0, ew, eh)
-                val flip = floatArrayOf(
-                    1f, 0f, 0f, 0f,
-                    0f, -1f, 0f, 0f,
-                    0f, 0f, 1f, 0f,
-                    0f, 0f, 0f, 1f
-                )
                 GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
                 GLES20.glBindTexture(android.opengl.GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex)
                 GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
                 GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, overlayTex)
                 effects.setParams(cfg.params, ew, eh, nowSeconds(), stampColorArr, stampRectArr)
-                effects.draw(quad, flip, uvMat)
+                effects.draw(quad, flipPos, uvMat)
                 readPhoto(ew, eh)
             }
         }
@@ -306,8 +318,85 @@ class GlPipe(private val appContext: Context) {
                         recNextNs = System.nanoTime()
                     }
                     is GlCommand.UpdateStamp -> uploadStamp(cmd.bitmap)
+                    is GlCommand.OfflineCapture -> renderOffline(cmd.bitmap, cmd.rotationDeg)
                 }
             }
+        }
+
+        /**
+         * Renders a full-resolution still (decoded ImageCapture JPEG) through
+         * the same effects pipeline, at the exact target size, into a
+         * dedicated FBO and reads it back for saving. Runs on the GL thread
+         * during command draining, before the live preview pass, using its
+         * own texture and FBO so preview state is untouched.
+         *
+         * The texture matrix mirrors the live path (ST * R * C * M) with the
+         * bitmap Y-flip standing in for the SurfaceTexture matrix:
+         *   FLIP_Y * R(rotationDeg) * C(crop) * M(mirror)
+         * which guarantees the photo matches the viewfinder field of view
+         * and orientation.
+         */
+        private fun renderOffline(bitmap: Bitmap, rotationDeg: Int) {
+            val quad = this.quad
+            if (quad == null) {
+                bitmap.recycle()
+                return
+            }
+            val cfg = config.get()
+            val outW = cfg.outW
+            val outH = cfg.outH
+            if (outW <= 0 || outH <= 0) {
+                bitmap.recycle()
+                return
+            }
+            try {
+                val p2d = effects2D ?: EffectProgram(ShaderSources.EFFECTS_FRAGMENT_2D)
+                    .also { effects2D = it }
+                if (captureTex == 0) captureTex = GlUtils.genTexture(GLES20.GL_TEXTURE_2D)
+                val bw = bitmap.width
+                val bh = bitmap.height
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, captureTex)
+                android.opengl.GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bitmap, 0)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+                bitmap.recycle()
+
+                val rot = ((rotationDeg % 360) + 360) % 360
+                val (csx, csy) = Framing.cropScale(bw, bh, rot, outW, outH)
+                var uvMat = Mat4.mul(Mat4.flipY(), Mat4.rotation(rot))
+                uvMat = Mat4.mul(uvMat, Mat4.crop(csx, csy))
+                if (cfg.mirror) uvMat = Mat4.mul(uvMat, Mat4.mirror())
+
+                val fbo = ensureOfflineFbo(outW, outH)
+                fbo.bind()
+                GLES20.glViewport(0, 0, outW, outH)
+                computeStampRect(cfg.params, stampBmpW, stampBmpH)
+
+                p2d.use()
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, captureTex)
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, overlayTex)
+                p2d.setParams(cfg.params, outW, outH, nowSeconds(), stampColorArr, stampRectArr)
+                p2d.draw(quad, flipPos, uvMat)
+                readPhoto(outW, outH)
+            } catch (t: Throwable) {
+                Log.e("GlPipe", "Offline capture render failed", t)
+                // Fall back to rendering from the live stream so a photo is
+                // still produced (and the flash overlay always clears).
+                post(GlCommand.CapturePhoto)
+            }
+        }
+
+        private fun ensureOfflineFbo(w: Int, h: Int): GlUtils.Fbo {
+            val cur = offlineFbo
+            if (cur != null && cur.w == w && cur.h == h) return cur
+            cur?.delete()
+            val fbo = GlUtils.createFbo(w, h)
+            offlineFbo = fbo
+            return fbo
         }
 
         private fun startRecording(cfg: RecConfig) {

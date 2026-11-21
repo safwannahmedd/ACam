@@ -2,6 +2,7 @@ package com.acam.camera
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Rect
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
@@ -17,6 +18,9 @@ import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
 import androidx.camera.core.SurfaceRequest
@@ -70,6 +74,13 @@ class CameraController(
         private set
     var caps: Caps? = null
         private set
+
+    /** True when the full-resolution ImageCapture use case is bound; the
+     *  photo path uses it instead of rendering from the live stream. */
+    @Volatile var imageCaptureReady: Boolean = false
+        private set
+
+    private var imageCapture: ImageCapture? = null
 
     /** Latest user preferences, supplied by the view model. */
     var prefsProvider: () -> CameraPrefs = { CameraPrefs() }
@@ -156,10 +167,29 @@ class CameraController(
                 }
                 .build()
 
-            // Ask for the largest <= ~12MP 4:3 preview stream the sensor can
-            // run; the actual delivered size defines the per-device maximum
-            // resolution exposed in the UI.
-            val resolutionSelector = ResolutionSelector.Builder()
+            // Live stream: 1080p-class. Many budget camera HALs nominally
+            // accept multi-megapixel preview-class (PRIVATE) streams but
+            // then deliver broken frames - solid color, half black - which
+            // is exactly what a 3264x2448 preview request triggers there.
+            // A 1440x1080 4:3 stream is universally reliable; full-res
+            // stills come from the ImageCapture (JPEG) use case instead.
+            val previewSelector = ResolutionSelector.Builder()
+                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                .setResolutionStrategy(
+                    ResolutionStrategy(
+                        Size(1440, 1080),
+                        ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
+                    )
+                )
+                .build()
+
+            val preview = Preview.Builder()
+                .setResolutionSelector(previewSelector)
+                .build()
+
+            // Full-resolution stills: the JPEG/BLOB path is the one camera
+            // output every HAL implements correctly at sensor resolution.
+            val stillSelector = ResolutionSelector.Builder()
                 .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
                 .setResolutionStrategy(
                     ResolutionStrategy(
@@ -168,9 +198,9 @@ class CameraController(
                     )
                 )
                 .build()
-
-            val preview = Preview.Builder()
-                .setResolutionSelector(resolutionSelector)
+            val stillCapture = ImageCapture.Builder()
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                .setResolutionSelector(stillSelector)
                 .build()
 
             preview.setSurfaceProvider(bgExecutor) { request: SurfaceRequest ->
@@ -178,7 +208,19 @@ class CameraController(
             }
 
             provider.unbindAll()
-            camera = provider.bindToLifecycle(lifecycleOwner, selector, preview)
+            imageCapture = null
+            imageCaptureReady = false
+            try {
+                camera = provider.bindToLifecycle(lifecycleOwner, selector, preview, stillCapture)
+                imageCapture = stillCapture
+                imageCaptureReady = true
+            } catch (t: Throwable) {
+                // Rare: a device that cannot combine the two use cases.
+                // Photos then render from the live stream (capped at its
+                // resolution) instead of the full sensor size.
+                Log.e(TAG, "ImageCapture bind failed; preview-only fallback", t)
+                camera = provider.bindToLifecycle(lifecycleOwner, selector, preview)
+            }
 
             val camera = this.camera ?: return
             val characteristics = Camera2CameraInfo.extractCameraCharacteristics(camera.cameraInfo)
@@ -223,6 +265,60 @@ class CameraController(
 
         val surface = Surface(st)
         request.provideSurface(surface, bgExecutor) { /* result ignored */ }
+    }
+
+    /**
+     * Full-resolution still capture through the ImageCapture use case.
+     * Delivers the JPEG bytes, the rotation that makes them upright for the
+     * current display orientation, and an optional crop rect (older devices
+     * express zoom as a metadata crop instead of cropping pixels).
+     */
+    fun takePicture(
+        displayRotation: Int,
+        onResult: (jpeg: ByteArray, rotationDeg: Int, cropRect: Rect?) -> Unit,
+        onError: (String) -> Unit
+    ) {
+        val capture = imageCapture
+        if (capture == null) {
+            onError("ImageCapture unavailable")
+            return
+        }
+        capture.targetRotation = when (displayRotation) {
+            90 -> Surface.ROTATION_90
+            180 -> Surface.ROTATION_180
+            270 -> Surface.ROTATION_270
+            else -> Surface.ROTATION_0
+        }
+        capture.takePicture(bgExecutor, object : ImageCapture.OnImageCapturedCallback() {
+            override fun onCaptureSuccess(image: ImageProxy) {
+                try {
+                    val plane = image.planes.firstOrNull()
+                    if (plane == null || plane.buffer.remaining() <= 0) {
+                        image.close()
+                        onError("empty capture")
+                        return
+                    }
+                    val buf = plane.buffer
+                    val jpeg = ByteArray(buf.remaining())
+                    buf.get(jpeg)
+                    val rot = image.imageInfo.rotationDegrees
+                    val crop = image.cropRect
+                    val useCrop = if (
+                        crop != null && crop.width() > 0 && crop.height() > 0 &&
+                        (crop.width() < image.width || crop.height() < image.height)
+                    ) crop else null
+                    image.close()
+                    onResult(jpeg, rot, useCrop)
+                } catch (t: Throwable) {
+                    runCatching { image.close() }
+                    onError(t.message ?: "capture")
+                }
+            }
+
+            override fun onError(exception: ImageCaptureException) {
+                onError(exception.message ?: "capture")
+            }
+        })
     }
 
     /** Apply manual controls through Camera2 interop. */

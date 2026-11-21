@@ -175,6 +175,15 @@ object Mat4 {
         1f, 0f, 0f, 1f
     )
 
+    /** Y flip: y -> 1 - y. Plays the role of the SurfaceTexture matrix for
+     *  bitmaps uploaded with GLUtils.texImage2D (row 0 lands at v = 0). */
+    fun flipY(): FloatArray = floatArrayOf(
+        1f, 0f, 0f, 0f,
+        0f, -1f, 0f, 0f,
+        0f, 0f, 1f, 0f,
+        0f, 1f, 0f, 1f
+    )
+
     /** Center crop: uv' = (uv - 0.5) * cs + 0.5. */
     fun crop(csx: Float, csy: Float): FloatArray = floatArrayOf(
         csx, 0f, 0f, 0f,

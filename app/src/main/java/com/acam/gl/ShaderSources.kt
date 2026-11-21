@@ -336,4 +336,15 @@ void main() {
     gl_FragColor = vec4(col, 1.0);
 }
 """
+
+    /**
+     * Identical effects pass for a plain GL_TEXTURE_2D input, used by the
+     * full-resolution offline photo render (ImageCapture JPEG). Generated
+     * from EFFECTS_FRAGMENT so the two can never drift apart: the shader
+     * that renders the saved photo is, line for line, the shader the
+     * viewfinder runs (WYSIWYG).
+     */
+    val EFFECTS_FRAGMENT_2D: String = EFFECTS_FRAGMENT
+        .replace("#extension GL_OES_EGL_image_external : require", "")
+        .replace("samplerExternalOES", "sampler2D")
 }

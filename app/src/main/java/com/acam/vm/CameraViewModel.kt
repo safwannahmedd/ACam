@@ -184,14 +184,19 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     // ------------------------------------------------------- pipe plumbing
 
-    /** Max output box (upright frame) for the current rotation. */
+    /** Max output box (upright frame) for the current rotation. Derived
+     *  from the full-resolution still-capture capability when available:
+     *  the live stream is capped lower (HAL reliability) but photos render
+     *  from the ImageCapture JPEG, so the picker may offer the full size. */
     fun uprightMax(s: AppState = _state.value): Size2 {
         val caps = s.caps ?: return Size2(1920, 1440)
         val rot = ((caps.sensorOrientation - s.displayRotation) % 360 + 360) % 360
+        val w = if (caps.captureW > 0) caps.captureW else caps.streamW
+        val h = if (caps.captureH > 0) caps.captureH else caps.streamH
         return if (rot == 90 || rot == 270) {
-            Size2(caps.streamH, caps.streamW)
+            Size2(h, w)
         } else {
-            Size2(caps.streamW, caps.streamH)
+            Size2(w, h)
         }
     }
 
@@ -566,10 +571,62 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             if (flash) controller?.startCaptureFlash(true)
             if (flash) delay(450)
             _state.update { it.copy(flashOverlay = true) }
-            pipe.post(GlCommand.CapturePhoto)
+            val controller = controller
+            if (controller != null && controller.imageCaptureReady) {
+                controller.takePicture(
+                    displayRotation = s.displayRotation,
+                    onResult = { jpeg, rot, crop ->
+                        decodeOfflineCapture(jpeg, rot, crop)
+                    },
+                    onError = { fallbackStreamCapture() }
+                )
+            } else {
+                fallbackStreamCapture()
+            }
             if (flash) {
                 delay(500)
                 controller?.startCaptureFlash(false)
+            }
+        }
+    }
+
+    /** Fallback: render the photo from the live preview stream (bounded
+     *  by the stream resolution). Used when ImageCapture is unavailable. */
+    private fun fallbackStreamCapture() {
+        pipe.post(GlCommand.CapturePhoto)
+    }
+
+    /**
+     * Decode the full-resolution ImageCapture JPEG and hand it to the GL
+     * pipeline, which renders it through the exact same effects shader as
+     * the viewfinder (WYSIWYG) at the exact target resolution. Zoom on
+     * older devices is a metadata crop, applied here before the upload.
+     */
+    private fun decodeOfflineCapture(
+        jpeg: ByteArray,
+        rotationDeg: Int,
+        crop: android.graphics.Rect?
+    ) {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.Default) {
+            val bitmap = runCatching {
+                var bmp = android.graphics.BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
+                if (bmp != null && crop != null && crop.width() > 0 && crop.height() > 0 &&
+                    (crop.width() < bmp.width || crop.height() < bmp.height)
+                ) {
+                    val cl = crop.left.coerceIn(0, bmp.width - 1)
+                    val ct = crop.top.coerceIn(0, bmp.height - 1)
+                    val cw = crop.width().coerceAtMost(bmp.width - cl)
+                    val ch = crop.height().coerceAtMost(bmp.height - ct)
+                    if (cw > 0 && ch > 0) {
+                        bmp = android.graphics.Bitmap.createBitmap(bmp, cl, ct, cw, ch)
+                    }
+                }
+                bmp
+            }.getOrNull()
+            if (bitmap != null) {
+                pipe.post(GlCommand.OfflineCapture(bitmap, rotationDeg))
+            } else {
+                fallbackStreamCapture()
             }
         }
     }

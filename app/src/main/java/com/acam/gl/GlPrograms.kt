@@ -10,9 +10,9 @@ import java.nio.FloatBuffer
  * and pushes an [EffectParams] as the packed vec4 uniforms declared in
  * ShaderSources.EFFECTS_FRAGMENT.
  */
-class EffectProgram {
+class EffectProgram(fragmentSrc: String = ShaderSources.EFFECTS_FRAGMENT) {
 
-    val program: Int = GlUtils.link(ShaderSources.VERTEX, ShaderSources.EFFECTS_FRAGMENT)
+    val program: Int = GlUtils.link(ShaderSources.VERTEX, fragmentSrc)
 
     private val aPosition = GLES20.glGetAttribLocation(program, "aPosition")
     private val aUV = GLES20.glGetAttribLocation(program, "aUV")
