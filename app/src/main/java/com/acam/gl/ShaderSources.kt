@@ -4,8 +4,16 @@ package com.acam.gl
  * The single GLSL pipeline shared by preview, photo capture and video
  * recording. One shader => WYSIWYG: the saved file is the viewfinder.
  *
- * GLSL ES 1.00 (an ES 2.0 context is used so that samplerExternalOES is
- * available on every device; see GlCameraView).
+ * GLSL ES 1.00. The camera source is sampled through the SAMPLE() macro so
+ * the exact same effects body renders from either input:
+ *
+ *  - a plain GL_TEXTURE_2D (full-resolution photo render, decoded JPEG), or
+ *  - the live YUV_420_888 viewfinder frames uploaded as planar textures
+ *    (ImageAnalysis use case).
+ *
+ * Both variants are generated from EFFECTS_BODY below and can therefore
+ * never drift apart: the shader that renders the saved photo is, line for
+ * line, the shader the viewfinder runs.
  */
 object ShaderSources {
 
@@ -37,26 +45,17 @@ void main() {
 """
 
     /**
-     * The effects pass: camera frame (external OES texture, already
-     * cropped/rotated/mirrored through uTexMatrix) -> offscreen FBO of the
-     * exact target size.
+     * The effects body. Every read of the camera source goes through
+     * SAMPLE(uv), a vec3 macro defined by the prologue of the variant.
      *
-     * Effect parameters arrive packed into vec4 uniforms (see EffectUniforms)
-     * to stay well within the 64-vec4 fragment uniform minimum of ES 2 GPUs.
+     * Effect parameters arrive packed into vec4 uniforms to stay well
+     * within the 64-vec4 fragment uniform minimum of ES 2 GPUs.
      * Multi-tap effects are gated behind uniform conditions, so disabled
      * effects cost nothing on mid-range GPUs.
      */
-    const val EFFECTS_FRAGMENT = """
-#extension GL_OES_EGL_image_external : require
-#ifdef GL_FRAGMENT_PRECISION_HIGH
-precision highp float;
-#else
-precision mediump float;
-#endif
-
+    private const val EFFECTS_BODY = """
 varying vec2 vUV;
 
-uniform samplerExternalOES uTex;   // camera frame
 uniform sampler2D uOverlay;        // date stamp bitmap (white on transparent)
 uniform vec2 uSize;                // output size in pixels
 uniform float uTime;               // seconds, animates grain/leaks/scanlines
@@ -119,21 +118,22 @@ void main() {
     vec3 col;
     if (caA > 0.001) {
         vec2 off = cc * (caA * 0.02 * rd);
-        col.r = texture2D(uTex, uv + off).r;
-        col.g = texture2D(uTex, uv).g;
-        col.b = texture2D(uTex, uv - off).b;
+        vec3 cr = SAMPLE(uv + off);
+        vec3 cg = SAMPLE(uv);
+        vec3 cb = SAMPLE(uv - off);
+        col = vec3(cr.r, cg.g, cb.b);
     } else {
-        col = texture2D(uTex, uv).rgb;
+        col = SAMPLE(uv);
     }
 
     // ---------- sharpness / softness (unsharp mask; negative = blur) ----------
     float shA = uLens0.x;
     if (abs(shA) > 0.005) {
         vec2 px = 1.0 / uSize;
-        vec3 n = texture2D(uTex, uv + vec2(0.0, px.y)).rgb;
-        vec3 s = texture2D(uTex, uv - vec2(0.0, px.y)).rgb;
-        vec3 e = texture2D(uTex, uv + vec2(px.x, 0.0)).rgb;
-        vec3 ww = texture2D(uTex, uv - vec2(px.x, 0.0)).rgb;
+        vec3 n = SAMPLE(uv + vec2(0.0, px.y));
+        vec3 s = SAMPLE(uv - vec2(0.0, px.y));
+        vec3 e = SAMPLE(uv + vec2(px.x, 0.0));
+        vec3 ww = SAMPLE(uv - vec2(px.x, 0.0));
         vec3 avg = (n + s + e + ww) * 0.25;
         col += (col - avg) * shA * 1.6;
     }
@@ -143,14 +143,14 @@ void main() {
     if (blA > 0.005) {
         vec2 px = 3.0 / uSize;
         vec3 b;
-        b  = texture2D(uTex, uv + vec2(px.x, 0.0)).rgb;
-        b += texture2D(uTex, uv - vec2(px.x, 0.0)).rgb;
-        b += texture2D(uTex, uv + vec2(0.0, px.y)).rgb;
-        b += texture2D(uTex, uv - vec2(0.0, px.y)).rgb;
-        b += texture2D(uTex, uv + px).rgb;
-        b += texture2D(uTex, uv - px).rgb;
-        b += texture2D(uTex, uv + vec2(px.x, -px.y)).rgb;
-        b += texture2D(uTex, uv + vec2(-px.x, px.y)).rgb;
+        b  = SAMPLE(uv + vec2(px.x, 0.0));
+        b += SAMPLE(uv - vec2(px.x, 0.0));
+        b += SAMPLE(uv + vec2(0.0, px.y));
+        b += SAMPLE(uv - vec2(0.0, px.y));
+        b += SAMPLE(uv + px);
+        b += SAMPLE(uv - px);
+        b += SAMPLE(uv + vec2(px.x, -px.y));
+        b += SAMPLE(uv + vec2(-px.x, px.y));
         b *= 0.125;
         vec3 bright = max(b - 0.62, 0.0) / 0.38;
         col += bright * blA * vec3(1.0, 0.72, 0.5) * 0.55;
@@ -163,8 +163,8 @@ void main() {
         vec2 uvL = (floor(uv / bp) + 0.5) * bp;
         vec2 mp = 16.0 / uSize;
         vec2 uvC = (floor(uv / mp) + 0.5) * mp;
-        vec3 bl = texture2D(uTex, uvL).rgb;
-        vec3 bc = texture2D(uTex, uvC).rgb;
+        vec3 bl = SAMPLE(uvL);
+        vec3 bc = SAMPLE(uvC);
         vec3 chroma = bc - vec3(luma(bc));
         col = mix(col, vec3(luma(bl)) + chroma, jpA);
         vec2 f = fract(uv / bp);
@@ -337,14 +337,83 @@ void main() {
 }
 """
 
+    // ------------------------------------------------------------------
+    // Variant prologues. Each defines SAMPLE(uv) -> vec3 and the source
+    // uniforms it needs, then appends the shared effects body.
+    // ------------------------------------------------------------------
+
+    /** Precision guard, shared by every variant: must be the FIRST thing
+     *  in the shader, before any float-bearing declarations. */
+    private const val PRECISION_GUARD = """
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+"""
+
+    /** Full-resolution photo render: the decoded ImageCapture JPEG as a
+     *  plain RGBA texture (row 0 of the bitmap lands at v = 0). */
+    val EFFECTS_FRAGMENT_2D = PRECISION_GUARD + """
+uniform sampler2D uTex;
+#define SAMPLE(uv) (texture2D(uTex, uv).rgb)
+""" + EFFECTS_BODY
+
     /**
-     * Identical effects pass for a plain GL_TEXTURE_2D input, used by the
-     * full-resolution offline photo render (ImageCapture JPEG). Generated
-     * from EFFECTS_FRAGMENT so the two can never drift apart: the shader
-     * that renders the saved photo is, line for line, the shader the
-     * viewfinder runs (WYSIWYG).
+     * Live viewfinder, planar YUV (I420): three GL_LUMINANCE textures.
+     * uYuvScale = (imageW / yTexW, 1, chromaW / uTexW, 1); the x scales
+     * remove row-stride padding so sampling is exact.
      */
-    val EFFECTS_FRAGMENT_2D: String = EFFECTS_FRAGMENT
-        .replace("#extension GL_OES_EGL_image_external : require", "")
-        .replace("samplerExternalOES", "sampler2D")
+    val EFFECTS_FRAGMENT_YUV_PLANAR = PRECISION_GUARD + """
+uniform sampler2D uTexY;
+uniform sampler2D uTexU;
+uniform sampler2D uTexV;
+uniform vec4 uYuvScale;
+vec3 yuvToRgb(float y, float u, float v) {
+    y = (y - 0.0627451) * 1.1643836;
+    u -= 0.5;
+    v -= 0.5;
+    return vec3(
+        y + 1.5960346 * v,
+        y - 0.3917623 * u - 0.8129676 * v,
+        y + 2.0172321 * u);
+}
+vec3 sampleYuv(vec2 uv) {
+    float y = texture2D(uTexY, vec2(uv.x * uYuvScale.x, uv.y)).r;
+    float u = texture2D(uTexU, vec2(uv.x * uYuvScale.z, uv.y)).r;
+    float v = texture2D(uTexV, vec2(uv.x * uYuvScale.z, uv.y)).r;
+    return yuvToRgb(y, u, v);
+}
+#define SAMPLE(uv) sampleYuv(uv)
+""" + EFFECTS_BODY
+
+    /**
+     * Live viewfinder, semi-planar YUV (NV12/NV21): luminance texture plus
+     * the interleaved chroma plane as GL_LUMINANCE_ALPHA (2 bytes per
+     * texel). uFirstIsU selects which byte is U: the plane whose buffer
+     * starts first owns the L channel.
+     */
+    val EFFECTS_FRAGMENT_YUV_SEMI = PRECISION_GUARD + """
+uniform sampler2D uTexY;
+uniform sampler2D uTexC;
+uniform vec4 uYuvScale;
+uniform float uFirstIsU;
+vec3 yuvToRgb(float y, float u, float v) {
+    y = (y - 0.0627451) * 1.1643836;
+    u -= 0.5;
+    v -= 0.5;
+    return vec3(
+        y + 1.5960346 * v,
+        y - 0.3917623 * u - 0.8129676 * v,
+        y + 2.0172321 * u);
+}
+vec3 sampleYuv(vec2 uv) {
+    float y = texture2D(uTexY, vec2(uv.x * uYuvScale.x, uv.y)).r;
+    vec4 c = texture2D(uTexC, vec2(uv.x * uYuvScale.z, uv.y));
+    float u = mix(c.a, c.r, uFirstIsU);
+    float v = mix(c.r, c.a, uFirstIsU);
+    return yuvToRgb(y, u, v);
+}
+#define SAMPLE(uv) sampleYuv(uv)
+""" + EFFECTS_BODY
 }

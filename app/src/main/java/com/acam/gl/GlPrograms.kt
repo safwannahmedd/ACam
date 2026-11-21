@@ -5,20 +5,43 @@ import com.acam.data.EffectParams
 import com.acam.data.FrameStyle
 import java.nio.FloatBuffer
 
+/** What the effects program samples its camera pixels from. */
+enum class SrcKind {
+    /** Plain RGBA texture: full-resolution photo render (decoded JPEG). */
+    TEX2D,
+
+    /** Live viewfinder, planar YUV (I420): Y/U/V luminance textures. */
+    YUV_PLANAR,
+
+    /** Live viewfinder, semi-planar YUV (NV12/NV21): Y + interleaved
+     *  LUMINANCE_ALPHA chroma texture. */
+    YUV_SEMI
+}
+
 /**
  * Thin wrapper around the effects shader program: caches uniform locations
- * and pushes an [EffectParams] as the packed vec4 uniforms declared in
- * ShaderSources.EFFECTS_FRAGMENT.
+ * and pushes an [EffectParams] as the packed vec4 uniforms declared in the
+ * effects shader. The [SrcKind] selects which sampling prologue the program
+ * is built from; the effects body is byte-identical in every variant.
+ *
+ * Texture units: 0 = Y (or the RGBA photo texture), 1 = U / interleaved
+ * chroma, 2 = V, 3 = date-stamp overlay.
  */
-class EffectProgram(fragmentSrc: String = ShaderSources.EFFECTS_FRAGMENT) {
+class EffectProgram(kind: SrcKind = SrcKind.TEX2D) {
 
-    val program: Int = GlUtils.link(ShaderSources.VERTEX, fragmentSrc)
+    val program: Int = GlUtils.link(
+        ShaderSources.VERTEX,
+        when (kind) {
+            SrcKind.TEX2D -> ShaderSources.EFFECTS_FRAGMENT_2D
+            SrcKind.YUV_PLANAR -> ShaderSources.EFFECTS_FRAGMENT_YUV_PLANAR
+            SrcKind.YUV_SEMI -> ShaderSources.EFFECTS_FRAGMENT_YUV_SEMI
+        }
+    )
 
     private val aPosition = GLES20.glGetAttribLocation(program, "aPosition")
     private val aUV = GLES20.glGetAttribLocation(program, "aUV")
     private val uPosMatrix = GLES20.glGetUniformLocation(program, "uPosMatrix")
     private val uTexMatrix = GLES20.glGetUniformLocation(program, "uTexMatrix")
-    private val uTex = GLES20.glGetUniformLocation(program, "uTex")
     private val uOverlay = GLES20.glGetUniformLocation(program, "uOverlay")
     private val uSize = GLES20.glGetUniformLocation(program, "uSize")
     private val uTime = GLES20.glGetUniformLocation(program, "uTime")
@@ -36,9 +59,56 @@ class EffectProgram(fragmentSrc: String = ShaderSources.EFFECTS_FRAGMENT) {
     private val uLens0 = GLES20.glGetUniformLocation(program, "uLens0")
     private val uLens1 = GLES20.glGetUniformLocation(program, "uLens1")
 
-    private val tmp4 = FloatArray(4)
+    // Source-specific uniforms.
+    private val uTex = GLES20.glGetUniformLocation(program, "uTex")
+    private val uTexY = GLES20.glGetUniformLocation(program, "uTexY")
+    private val uTexU = GLES20.glGetUniformLocation(program, "uTexU")
+    private val uTexV = GLES20.glGetUniformLocation(program, "uTexV")
+    private val uTexC = GLES20.glGetUniformLocation(program, "uTexC")
+    private val uYuvScale = GLES20.glGetUniformLocation(program, "uYuvScale")
+    private val uFirstIsU = GLES20.glGetUniformLocation(program, "uFirstIsU")
+
+    init {
+        // Sampler unit assignments are constant for the program's lifetime.
+        GLES20.glUseProgram(program)
+        when (kind) {
+            SrcKind.TEX2D -> GLES20.glUniform1i(uTex, 0)
+            SrcKind.YUV_PLANAR -> {
+                GLES20.glUniform1i(uTexY, 0)
+                GLES20.glUniform1i(uTexU, 1)
+                GLES20.glUniform1i(uTexV, 2)
+            }
+            SrcKind.YUV_SEMI -> {
+                GLES20.glUniform1i(uTexY, 0)
+                GLES20.glUniform1i(uTexC, 1)
+            }
+        }
+        GLES20.glUniform1i(uOverlay, 3)
+    }
 
     fun use() = GLES20.glUseProgram(program)
+
+    /**
+         * Upload the plane-scale uniform for YUV variants. For TEX2D it is a
+         * no-op. scale = (imageW / yTexW, 1, chromaW / cTexW, 1).
+         *
+         * Binds the program first: this can be called right after a frame
+         * upload, when a different program (e.g. the blit) is current.
+         */
+    fun setYuvScale(scale: FloatArray) {
+        if (uYuvScale >= 0) {
+            GLES20.glUseProgram(program)
+            GLES20.glUniform4fv(uYuvScale, 1, scale, 0)
+        }
+    }
+
+    /** Which byte of the interleaved chroma texel is U (semi-planar only). */
+    fun setFirstIsU(firstIsU: Boolean) {
+        if (uFirstIsU >= 0) {
+            GLES20.glUseProgram(program)
+            GLES20.glUniform1f(uFirstIsU, if (firstIsU) 1f else 0f)
+        }
+    }
 
     /**
      * Upload all effect parameters. Called once per frame; all values are
@@ -77,9 +147,6 @@ class EffectProgram(fragmentSrc: String = ShaderSources.EFFECTS_FRAGMENT) {
         )
         GLES20.glUniform4fv(uStampColor, 1, stampColor, 0)
         GLES20.glUniform4fv(uStampRect, 1, stampRect, 0)
-
-        GLES20.glUniform1i(uTex, 0)
-        GLES20.glUniform1i(uOverlay, 1)
     }
 
     fun draw(quad: FloatBuffer, posMatrix: FloatArray, texMatrix: FloatArray) {

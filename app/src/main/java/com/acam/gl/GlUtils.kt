@@ -1,6 +1,5 @@
 package com.acam.gl
 
-import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.util.Log
 import java.nio.ByteBuffer
@@ -87,22 +86,11 @@ object GlUtils {
     fun genTexture(target: Int): Int {
         val ids = IntArray(1)
         GLES20.glGenTextures(1, ids, 0)
-        when (target) {
-            GLES20.GL_TEXTURE_2D -> {
-                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, ids[0])
-                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-            }
-            GLES11Ext.GL_TEXTURE_EXTERNAL_OES -> {
-                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, ids[0])
-                GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-                GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-                GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-                GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-            }
-        }
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, ids[0])
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         return ids[0]
     }
 
@@ -132,16 +120,19 @@ object GlUtils {
 /**
  * Minimal column-major 4x4 matrix math for the UV transform chain:
  *
- *   vUV = ST * R * C * M * uv
+ *   vUV = FLIP_Y * R * C * M * uv
  *
  * applied in this order to a target-space (upright, top-left origin) uv:
  *   M = optional horizontal mirror (front camera)
  *   C = center-crop to the target ratio, computed in UPRIGHT space
  *   R = rotate upright -> sensor/stream orientation
- *   ST = SurfaceTexture transform (includes the GL Y-flip)
+ *   FLIP_Y = row order of the uploaded textures (row 0 lands at v = 0,
+ *          true for both GLUtils bitmap uploads and YUV plane uploads)
  *
  * Getting this order right is what guarantees "circles stay circles" and
- * "same field of view at every resolution".
+ * "same field of view at every resolution". The live viewfinder and the
+ * full-resolution photo render use the IDENTICAL chain, so the viewfinder
+ * is literally the saved photo.
  */
 object Mat4 {
 
@@ -175,8 +166,9 @@ object Mat4 {
         1f, 0f, 0f, 1f
     )
 
-    /** Y flip: y -> 1 - y. Plays the role of the SurfaceTexture matrix for
-     *  bitmaps uploaded with GLUtils.texImage2D (row 0 lands at v = 0). */
+    /** Y flip: y -> 1 - y. Row 0 of every uploaded source texture
+     *  (bitmap via GLUtils.texImage2D, YUV planes) lands at v = 0, and the
+     *  pipeline's target space has its origin at the top-left. */
     fun flipY(): FloatArray = floatArrayOf(
         1f, 0f, 0f, 0f,
         0f, -1f, 0f, 0f,

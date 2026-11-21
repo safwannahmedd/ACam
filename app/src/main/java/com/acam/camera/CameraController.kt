@@ -18,12 +18,11 @@ import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
-import androidx.camera.core.Preview
 import androidx.camera.core.SurfaceOrientedMeteringPointFactory
-import androidx.camera.core.SurfaceRequest
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.core.resolutionselector.ResolutionStrategy
@@ -44,9 +43,18 @@ data class LensEntry(
 )
 
 /**
- * Owns the CameraX binding: one Preview use case feeding our GL
- * SurfaceTexture, plus Camera2 interop for manual ISO / shutter / focus /
- * white balance / stabilization.
+ * Owns the CameraX binding: one ImageAnalysis use case feeding YUV frames
+ * to the GL pipeline, plus Camera2 interop for manual ISO / shutter /
+ * focus / white balance / stabilization.
+ *
+ * The viewfinder consumes YUV_420_888 ImageAnalysis frames instead of a
+ * PRIVATE Preview stream. Reason: on a class of budget camera HALs the
+ * PRIVATE (opaque) stream delivered to a SurfaceTexture produces broken
+ * frames - flat color fields, half-written buffers - while the two
+ * mandated, universally reliable camera outputs are exactly YUV_420_888
+ * (every scanner/CV app) and JPEG (used here for full-res stills).
+ * Photos are captured through ImageCapture and rendered through the same
+ * effects shader, so WYSIWYG is preserved by construction.
  *
  * Binding patterns adapted from android/camera-samples (Apache-2.0).
  *
@@ -64,6 +72,7 @@ class CameraController(
     }
 
     private val bgExecutor: Executor = Executors.newSingleThreadExecutor()
+    private val analyzerExecutor: Executor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
 
     var camera: Camera? = null
@@ -133,6 +142,12 @@ class CameraController(
                 val firstBack = entries.indexOfFirst { !it.isFront }
                 activeIndex = if (firstBack >= 0) firstBack else 0
                 onEntriesChanged?.invoke(entries, activeIndex)
+
+                // Refine caps (stream size, crop math) whenever the GL
+                // pipeline reports the live frame size it is receiving.
+                pipe.onStreamSize = { w, h ->
+                    mainHandler.post { refineCapsWithStream(w, h) }
+                }
                 bind()
             } catch (t: Throwable) {
                 Log.e(TAG, "Camera init failed", t)
@@ -167,13 +182,13 @@ class CameraController(
                 }
                 .build()
 
-            // Live stream: 1080p-class. Many budget camera HALs nominally
-            // accept multi-megapixel preview-class (PRIVATE) streams but
-            // then deliver broken frames - solid color, half black - which
-            // is exactly what a 3264x2448 preview request triggers there.
-            // A 1440x1080 4:3 stream is universally reliable; full-res
-            // stills come from the ImageCapture (JPEG) use case instead.
-            val previewSelector = ResolutionSelector.Builder()
+            // Live viewfinder: YUV_420_888 frames via ImageAnalysis. This
+            // is the camera output every HAL implements correctly at
+            // preview rates (the same path every scanner / CV app uses);
+            // the PRIVATE preview stream this device class breaks is not
+            // used at all. A 4:3 1440x1080-class analysis stream keeps the
+            // viewfinder field of view identical to the 4:3 JPEG stills.
+            val analysisSelector = ResolutionSelector.Builder()
                 .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
                 .setResolutionStrategy(
                     ResolutionStrategy(
@@ -183,9 +198,14 @@ class CameraController(
                 )
                 .build()
 
-            val preview = Preview.Builder()
-                .setResolutionSelector(previewSelector)
+            val analysis = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
+                .setResolutionSelector(analysisSelector)
                 .build()
+            analysis.setAnalyzer(analyzerExecutor) { image ->
+                pipe.submitFrame(image)
+            }
 
             // Full-resolution stills: the JPEG/BLOB path is the one camera
             // output every HAL implements correctly at sensor resolution.
@@ -203,23 +223,19 @@ class CameraController(
                 .setResolutionSelector(stillSelector)
                 .build()
 
-            preview.setSurfaceProvider(bgExecutor) { request: SurfaceRequest ->
-                handleSurfaceRequest(request, entry)
-            }
-
             provider.unbindAll()
             imageCapture = null
             imageCaptureReady = false
             try {
-                camera = provider.bindToLifecycle(lifecycleOwner, selector, preview, stillCapture)
+                camera = provider.bindToLifecycle(lifecycleOwner, selector, analysis, stillCapture)
                 imageCapture = stillCapture
                 imageCaptureReady = true
             } catch (t: Throwable) {
                 // Rare: a device that cannot combine the two use cases.
-                // Photos then render from the live stream (capped at its
+                // Photos then render from the live stream (bounded by its
                 // resolution) instead of the full sensor size.
-                Log.e(TAG, "ImageCapture bind failed; preview-only fallback", t)
-                camera = provider.bindToLifecycle(lifecycleOwner, selector, preview)
+                Log.e(TAG, "ImageCapture bind failed; viewfinder-only fallback", t)
+                camera = provider.bindToLifecycle(lifecycleOwner, selector, analysis)
             }
 
             val camera = this.camera ?: return
@@ -237,34 +253,23 @@ class CameraController(
         }
     }
 
-    private fun handleSurfaceRequest(request: SurfaceRequest, entry: LensEntry) {
-        // Wait (bounded) for the GL thread to create the SurfaceTexture.
-        var st = pipe.surfaceTexture
-        var waited = 0
-        while (st == null && waited < 5000) {
-            Thread.sleep(50)
-            waited += 50
-            st = pipe.surfaceTexture
-        }
-        if (st == null) {
-            Log.e(TAG, "SurfaceTexture never appeared; camera preview unavailable")
-            return
-        }
-        val res: Size = request.resolution
-        st.setDefaultBufferSize(res.width, res.height)
-        pipe.streamW = res.width
-        pipe.streamH = res.height
-
-        val camera = this.camera
-        if (camera != null) {
-            val characteristics = Camera2CameraInfo.extractCameraCharacteristics(camera.cameraInfo)
-            val newCaps = Caps.from(characteristics, entry.cameraId, entry.label, res.width, res.height, null)
+    /** Rebuild caps when the live stream reports its actual frame size
+     *  (called from the GL thread via the pipe, hence the main-thread hop).
+     *  The stream size drives the viewfinder framing math and the
+     *  tap-to-focus coordinate mapping. */
+    private fun refineCapsWithStream(w: Int, h: Int) {
+        val camera = camera ?: return
+        val entry = entries.getOrNull(activeIndex) ?: return
+        val current = caps
+        if (current != null && current.streamW == w && current.streamH == h) return
+        val characteristics = runCatching {
+            Camera2CameraInfo.extractCameraCharacteristics(camera.cameraInfo)
+        }.getOrNull() ?: return
+        val newCaps = Caps.from(characteristics, entry.cameraId, entry.label, w, h, null)
+        if (newCaps != caps) {
             caps = newCaps
-            mainHandler.post { onCapsChanged?.invoke(newCaps) }
+            onCapsChanged?.invoke(newCaps)
         }
-
-        val surface = Surface(st)
-        request.provideSurface(surface, bgExecutor) { /* result ignored */ }
     }
 
     /**
