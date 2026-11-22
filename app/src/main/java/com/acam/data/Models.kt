@@ -71,6 +71,17 @@ data class EffectParams(
     val bwAmount: Float = 0f,        // 0..1
     val sepiaAmount: Float = 0f,     // 0..1
     val toneCurve: Float = 0f,       // 0..1 filmic S-curve strength
+    // --- Stylize (1.2.7) ---
+    val hue: Float = 0f,             // -0.5..0.5 turns (full hue wheel rotation)
+    val vibrance: Float = 0f,        // -1..1, saturation boost weighted toward muted colors
+    val splitAmount: Float = 0f,     // 0..1 split-toning strength
+    val splitShadowHue: Float = 0.55f,   // 0..1 hue wheel, tint for shadows (default teal)
+    val splitHighlightHue: Float = 0.08f, // 0..1 hue wheel, tint for highlights (default orange)
+    val duotoneAmount: Float = 0f,   // 0..1 map luma to two ink colors
+    val duoDarkHue: Float = 0.60f,   // 0..1 hue wheel, dark ink
+    val duoLightHue: Float = 0.12f,  // 0..1 hue wheel, light ink
+    val pixelate: Float = 0f,        // 0..1 mosaic block size
+    val halftone: Float = 0f,        // 0..1 rotated dot-screen print look
     // --- Film ---
     val grainAmount: Float = 0f,     // 0..1
     val grainSize: Float = 1f,       // 0.5..4, relative to frame height
@@ -93,17 +104,22 @@ data class EffectParams(
     val dither: Float = 0f,          // 0..1 ordered dithering strength
     // --- Overlays ---
     val frame: FrameStyle = FrameStyle.NONE,
+    val frameScale: Float = 1f,      // 0.5..2 border thickness multiplier
     val dateStamp: Boolean = false
 )
 
 @Serializable
-enum class FrameStyle { NONE, POLAROID, FILM_STRIP }
+enum class FrameStyle {
+    NONE, POLAROID, FILM_STRIP,
+    THIN_WHITE, THIN_BLACK, FULL_WHITE, FULL_BLACK
+}
 
 @Serializable
 data class DateStampConfig(
     /** SimpleDateFormat pattern, or any literal text if parsing fails. */
     val text: String = "MMM d, yyyy  h:mm a",
-    val corner: Int = 1,             // 0 top-left, 1 bottom-right
+    /** 0 top-left, 1 bottom-right, 2 bottom-left, 3 top-right. */
+    val corner: Int = 1,
     val colorArgb: Long = 0xFFFF8A00L
 )
 

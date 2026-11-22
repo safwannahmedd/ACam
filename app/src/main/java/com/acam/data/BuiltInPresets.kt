@@ -132,6 +132,150 @@ object BuiltInPresets {
                 colorDepth = 48, scanlines = 0.08f
             ),
             ratio = Ratio.FOUR_THREE, k = 160, videoFps = 15
+        ),
+
+        // ---------------- Modern grading & cinema looks (1.2.7) ----------------
+        Preset(
+            id = "cine", name = "Cinematic", builtin = true,
+            params = EffectParams(
+                splitAmount = 0.7f, splitShadowHue = 0.55f, splitHighlightHue = 0.08f,
+                contrast = 0.12f, toneCurve = 0.22f, saturation = -0.05f,
+                vignette = 0.15f, grainAmount = 0.05f
+            ),
+            ratio = Ratio.THREE_TWO, k = 0
+        ),
+        Preset(
+            id = "crossprocess", name = "Cross Process", builtin = true,
+            params = EffectParams(
+                splitAmount = 0.8f, splitShadowHue = 0.38f, splitHighlightHue = 0.13f,
+                contrast = 0.25f, saturation = 0.25f, toneCurve = 0.2f,
+                grainAmount = 0.1f, aberration = 0.15f
+            ),
+            ratio = Ratio.THREE_TWO, k = 0
+        ),
+        Preset(
+            id = "technicolor", name = "Technicolor", builtin = true,
+            params = EffectParams(
+                vibrance = 0.55f, saturation = 0.3f, contrast = 0.15f,
+                mixerRR = 1.12f, mixerRG = 0.04f, mixerGB = 0.04f,
+                mixerBB = 1.12f, bloom = 0.06f
+            ),
+            ratio = Ratio.FOUR_THREE, k = 0
+        ),
+        Preset(
+            id = "noir", name = "Noir", builtin = true,
+            params = EffectParams(
+                bwAmount = 1f, contrast = 0.42f, toneCurve = 0.4f,
+                vignette = 0.35f, grainAmount = 0.22f, sharpness = 0.15f
+            ),
+            ratio = Ratio.THREE_TWO, k = 0
+        ),
+        Preset(
+            id = "lomo", name = "Lomo", builtin = true,
+            params = EffectParams(
+                saturation = 0.35f, contrast = 0.2f, vignette = 0.6f,
+                vignetteSize = 0.6f, distortion = 0.2f, grainAmount = 0.15f
+            ),
+            ratio = Ratio.SQUARE, k = 0
+        ),
+        Preset(
+            id = "pastel", name = "Faded Pastel", builtin = true,
+            params = EffectParams(
+                blackPoint = 0.22f, saturation = -0.25f, contrast = -0.1f,
+                exposure = 0.08f, splitAmount = 0.35f,
+                splitShadowHue = 0.9f, splitHighlightHue = 0.12f
+            ),
+            ratio = Ratio.FOUR_FIVE, k = 0
+        ),
+        Preset(
+            id = "golden", name = "Golden Hour", builtin = true,
+            params = EffectParams(
+                temperature = 0.3f, exposure = 0.1f, bloom = 0.25f,
+                saturation = 0.12f, splitAmount = 0.3f,
+                splitShadowHue = 0.5f, splitHighlightHue = 0.1f,
+                vignette = 0.12f
+            ),
+            ratio = Ratio.THREE_FOUR, k = 0
+        ),
+        Preset(
+            id = "neon", name = "Neon Night", builtin = true,
+            params = EffectParams(
+                duotoneAmount = 0.55f, duoDarkHue = 0.55f, duoLightHue = 0.88f,
+                contrast = 0.3f, bloom = 0.25f, vignette = 0.3f,
+                grainAmount = 0.08f
+            ),
+            ratio = Ratio.NINE_SIXTEEN, k = 0
+        ),
+        Preset(
+            id = "infrared", name = "Infrared", builtin = true,
+            params = EffectParams(
+                mixerRR = 0.1f, mixerRG = 0.1f, mixerRB = 0.9f,
+                mixerBR = 0.85f, mixerBG = 0.1f, mixerBB = 0.15f,
+                contrast = 0.2f, saturation = 0.2f, vignette = 0.2f,
+                grainAmount = 0.1f
+            ),
+            ratio = Ratio.THREE_FOUR, k = 0
+        ),
+
+        // ---------------- Print & screen looks (1.2.7) ----------------
+        Preset(
+            id = "comic", name = "Comic Print", builtin = true,
+            params = EffectParams(
+                halftone = 0.85f, saturation = 0.3f, contrast = 0.25f,
+                colorDepth = 20
+            ),
+            ratio = Ratio.THREE_FOUR, k = 800
+        ),
+        Preset(
+            id = "blueprint", name = "Blueprint", builtin = true,
+            params = EffectParams(
+                duotoneAmount = 1f, duoDarkHue = 0.63f, duoLightHue = 0.55f,
+                halftone = 0.5f
+            ),
+            ratio = Ratio.THREE_FOUR, k = 600
+        ),
+        Preset(
+            id = "thermal", name = "Thermal Cam", builtin = true,
+            params = EffectParams(
+                duotoneAmount = 1f, duoDarkHue = 0.72f, duoLightHue = 0.02f,
+                pixelate = 0.45f, contrast = 0.3f, colorNoise = 0.1f
+            ),
+            ratio = Ratio.FOUR_THREE, k = 400, videoFps = 15
+        ),
+        Preset(
+            id = "gameboy", name = "Game Boy", builtin = true,
+            params = EffectParams(
+                duotoneAmount = 1f, duoDarkHue = 0.33f, duoLightHue = 0.38f,
+                pixelate = 0.85f, dither = 0.6f
+            ),
+            ratio = Ratio.SQUARE, k = 160
+        ),
+        Preset(
+            id = "mosaic", name = "Mosaic", builtin = true,
+            params = EffectParams(
+                pixelate = 0.55f, colorDepth = 24, dither = 0.15f
+            ),
+            ratio = Ratio.SQUARE, k = 320
+        ),
+
+        // ---------------- More era looks (1.2.7) ----------------
+        Preset(
+            id = "y2k", name = "Y2K Digicam", builtin = true,
+            params = EffectParams(
+                temperature = -0.1f, saturation = 0.1f, bloom = 0.12f,
+                blackPoint = 0.05f, sharpness = -0.1f, jpegBlocking = 0.2f,
+                grainAmount = 0.06f, lightLeak = 0.12f
+            ),
+            ratio = Ratio.FOUR_THREE, k = 640, videoFps = 15
+        ),
+        Preset(
+            id = "vhs", name = "VHS Cam", builtin = true,
+            params = EffectParams(
+                scanlines = 0.6f, colorNoise = 0.4f, aberration = 0.35f,
+                saturation = 0.12f, contrast = -0.05f, jpegBlocking = 0.3f,
+                dither = 0.2f, grainAmount = 0.12f
+            ),
+            ratio = Ratio.FOUR_THREE, k = 480, videoFps = 24
         )
     )
 

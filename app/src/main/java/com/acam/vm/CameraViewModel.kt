@@ -291,7 +291,8 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 // viewfinder-only sessions (the 1.2.5 fix - budget HALs
                 // mangle non-still streams when zoom is a sensor-space
                 // crop region); hardware-zoomed sessions ignore it.
-                zoom = s.cameraPrefs.zoom
+                zoom = s.cameraPrefs.zoom,
+                stampCorner = s.dateStamp.corner
             )
         )
     }
@@ -321,6 +322,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     fun updateDateStamp(transform: (DateStampConfig) -> DateStampConfig) {
         _state.update { it.copy(dateStamp = transform(it.dateStamp)) }
         pushStampIfActive()
+        pushPipeConfig()
     }
 
     fun updateUi(transform: (UiPrefs) -> UiPrefs) {
@@ -340,6 +342,36 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     fun setPhotoMode(photo: Boolean) {
         if (_state.value.recording) return
         _state.update { it.copy(photoMode = photo) }
+    }
+
+    /** Shuffle the look: randomize a curated subset of the effect knobs
+     *  within tasteful bounds. Film-archival things (frames, date stamp,
+     *  JPEG blocking, color depth) are deliberately left untouched; tap
+     *  the preset's reset dot to go back. */
+    fun shuffleLook() {
+        val r = { kotlin.random.Random.nextDouble() }
+        updateParams { p ->
+            p.copy(
+                hue = ((r() * 2 - 1) * 0.12).toFloat(),
+                vibrance = ((r() * 2 - 1) * 0.4).toFloat(),
+                saturation = ((r() * 2 - 1) * 0.25).toFloat(),
+                temperature = ((r() * 2 - 1) * 0.2).toFloat(),
+                contrast = ((r() * 2 - 1) * 0.2).toFloat(),
+                toneCurve = (r() * 0.35).toFloat(),
+                blackPoint = (r() * 0.15).toFloat(),
+                splitAmount = (r() * 0.6).toFloat(),
+                splitShadowHue = r().toFloat(),
+                splitHighlightHue = r().toFloat(),
+                duotoneAmount = if (r() < 0.25) (r() * 0.9).toFloat() else 0f,
+                duoDarkHue = r().toFloat(),
+                duoLightHue = r().toFloat(),
+                pixelate = if (r() < 0.2) (r() * 0.6).toFloat() else 0f,
+                halftone = if (r() < 0.15) (r() * 0.7).toFloat() else 0f,
+                grainAmount = (r() * 0.18).toFloat(),
+                bloom = (r() * 0.2).toFloat(),
+                vignette = (r() * 0.3).toFloat()
+            )
+        }
     }
 
     fun setAdjustOpen(open: Boolean) {

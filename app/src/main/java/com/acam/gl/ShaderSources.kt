@@ -104,12 +104,15 @@ uniform vec4 uStampRect;           // stamp placement x,y,w,h in output uv
 uniform vec4 uColor0;  // x=exposure y=contrast z=brightness w=saturation
 uniform vec4 uColor1;  // x=temperature y=tint z=highlights w=shadows
 uniform vec4 uColor2;  // x=blackPoint y=toneCurve z=bwAmount w=sepiaAmount
+uniform vec4 uColor3;  // x=hue y=vibrance z=splitAmount w=duotoneAmount
+uniform vec4 uColor4;  // x=splitShadowHue y=splitHighlightHue z=duoDarkHue w=duoLightHue
 uniform vec4 uMixR;    // channel mixer, output-red row
 uniform vec4 uMixG;    // channel mixer, output-green row
 uniform vec4 uMixB;    // channel mixer, output-blue row
 uniform vec4 uFilm0;   // x=grainAmount y=grainSize z=grainColor w=colorNoise
 uniform vec4 uFilm1;   // x=bloom y=dust z=lightLeak w=leakType
 uniform vec4 uFilm2;   // x=scanlines y=jpegBlocking z=colorDepth w=dither
+uniform vec4 uFilm3;   // x=pixelate y=halftone z=frameScale w=unused
 uniform vec4 uLens0;   // x=sharpness y=vignette z=vignetteSize w=aberration
 uniform vec4 uLens1;   // x=distortion y=frame z=dateStampOn w=unused
 
@@ -125,6 +128,18 @@ float hash(vec2 p) {
 float hashT(vec2 p) {
     vec2 q = p + vec2(fract(uTime * 7.13), fract(uTime * 3.71));
     return fract(sin(dot(q, vec2(127.1, 311.7))) * 43758.5453123);
+}
+
+// Pure spectral hue (0..1 wheel) to unit rgb.
+vec3 hue2rgb(float h) {
+    return clamp(abs(mod(h * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+}
+
+// Rotate a color's hue by a radians (Rodrigues rotation about the gray axis).
+vec3 hueShift(vec3 c, float a) {
+    const vec3 k = vec3(0.57735);
+    float ca = cos(a);
+    return c * ca + cross(k, c) * sin(a) + k * dot(k, c) * (1.0 - ca);
 }
 
 void main() {
@@ -147,6 +162,15 @@ void main() {
         float jit = (hashT(vec2(line, 3.7)) - 0.5) * 0.012 * scanA;
         float band = exp(-pow((uv.y - fract(uTime * 0.11)) * 12.0, 2.0));
         uv.x += jit + band * (hashT(vec2(line, 9.1)) - 0.5) * 0.06 * scanA;
+    }
+
+    // ---------- pixelate / mosaic ----------
+    // Block size goes from 1px (no-op) to ~1/12 of the short side.
+    float pxA = uFilm3.x;
+    if (pxA > 0.003) {
+        float blockPx = max(1.0, mix(1.0, min(w, h) / 12.0, pxA));
+        vec2 grid = uSize / blockPx;
+        uv = (floor(uv * grid) + 0.5) / grid;
     }
 
     vec2 cc = uv - 0.5;
@@ -225,6 +249,19 @@ void main() {
     col = mix(vec3(l0), col, 1.0 + uColor0.w);
     col = (col - 0.5) * (1.0 + uColor0.y) + 0.5;
 
+    // ---------- hue shift ----------
+    float hsA = uColor3.x;
+    if (abs(hsA) > 0.001) col = hueShift(col, hsA * 6.2831853);
+
+    // ---------- vibrance (boosts muted colors more than saturated ones) ----------
+    float vbA = uColor3.y;
+    if (abs(vbA) > 0.001) {
+        float mx = max(col.r, max(col.g, col.b));
+        float av = (col.r + col.g + col.b) / 3.0;
+        float satw = mx - av;
+        col = mix(vec3(luma(col)), col, 1.0 + vbA * (1.0 - satw));
+    }
+
     // ---------- highlights / shadows ----------
     float lum1 = luma(col);
     col += uColor1.z * smoothstep(0.45, 1.0, lum1) * 0.5;
@@ -253,6 +290,40 @@ void main() {
                        dot(col, vec3(0.349, 0.686, 0.168)),
                        dot(col, vec3(0.272, 0.534, 0.131)));
         col = mix(col, se, sp);
+    }
+
+    // ---------- split toning (shadows & highlights tinted separately) ----------
+    float stA = uColor3.z;
+    if (stA > 0.003) {
+        float sl2 = luma(col);
+        vec3 sdt = hue2rgb(uColor4.x) - 0.5;
+        vec3 hlt = hue2rgb(uColor4.y) - 0.5;
+        col += sdt * stA * 0.45 * (1.0 - smoothstep(0.0, 0.55, sl2));
+        col += hlt * stA * 0.45 * smoothstep(0.45, 1.0, sl2);
+    }
+
+    // ---------- duotone (luma mapped to two ink colors) ----------
+    float dtA = uColor3.w;
+    if (dtA > 0.003) {
+        vec3 inkD = hue2rgb(uColor4.z) * 0.75;
+        vec3 inkL = hue2rgb(uColor4.w) * 0.25 + 0.75;
+        float dl = luma(col);
+        col = mix(col, mix(inkD, inkL, smoothstep(0.05, 0.95, dl)), dtA);
+    }
+
+    // ---------- halftone (rotated dot screen) ----------
+    float hA = uFilm3.y;
+    if (hA > 0.003) {
+        float cell = max(3.0, h / 110.0);
+        float ang = 0.5236;
+        mat2 rotM = mat2(cos(ang), -sin(ang), sin(ang), cos(ang));
+        vec2 rp = rotM * (uv * uSize / cell);
+        vec2 f = fract(rp) - 0.5;
+        float hl = luma(col);
+        float radius = sqrt(1.0 - hl) * 0.75;
+        float dotv = 1.0 - smoothstep(radius - 0.12, radius + 0.12, length(f));
+        vec3 ink = clamp(col / max(hl, 0.02) * 0.7, 0.0, 1.0);
+        col = mix(col, mix(vec3(0.96), ink, dotv), hA);
     }
 
     // ---------- film grain (animated, size relative to frame height) ----------
@@ -353,22 +424,47 @@ void main() {
     // identical in every render path, so preview, photo and video all
     // show the exact same, designed frame.
     float fr = uLens1.y;
+    float fS = clamp(uFilm3.z, 0.25, 4.0);   // border thickness multiplier
     if (fr > 0.5 && fr < 1.5) {
         // Polaroid: thin white border top/left/right, thicker at the bottom.
-        float bw = 0.045;
-        float bb = 0.155;
+        float bw = 0.045 * fS;
+        float bb = 0.155 * fS;
         float inX = step(bw, vFrameUV.x) * step(vFrameUV.x, 1.0 - bw);
         float inY = step(bb, vFrameUV.y) * step(vFrameUV.y, 1.0 - bw);
         col = mix(vec3(0.965, 0.960, 0.940), col, inX * inY);
-    } else if (fr > 1.5) {
+    } else if (fr > 1.5 && fr < 2.5) {
         // Film strip: dark bands with sprocket holes.
-        float tb = 0.115;
+        float tb = 0.115 * fS;
         float band = step(vFrameUV.y, tb) + step(1.0 - tb, vFrameUV.y);
         float fx = fract(vFrameUV.x * 10.0);
         float fyT = step(tb * 0.25, vFrameUV.y) * step(vFrameUV.y, tb * 0.75);
         float fyB = step(1.0 - tb * 0.75, vFrameUV.y) * step(vFrameUV.y, 1.0 - tb * 0.25);
         float hole = step(0.28, fx) * step(fx, 0.72) * max(fyT, fyB);
         col = mix(col, vec3(0.07, 0.065, 0.06), band * (1.0 - hole));
+    } else if (fr > 2.5 && fr < 3.5) {
+        // Thin white keyline.
+        float bw = 0.022 * fS;
+        float inX = step(bw, vFrameUV.x) * step(vFrameUV.x, 1.0 - bw);
+        float inY = step(bw, vFrameUV.y) * step(vFrameUV.y, 1.0 - bw);
+        col = mix(vec3(0.965, 0.960, 0.940), col, inX * inY);
+    } else if (fr > 3.5 && fr < 4.5) {
+        // Thin black keyline.
+        float bw = 0.022 * fS;
+        float inX = step(bw, vFrameUV.x) * step(vFrameUV.x, 1.0 - bw);
+        float inY = step(bw, vFrameUV.y) * step(vFrameUV.y, 1.0 - bw);
+        col = mix(vec3(0.05, 0.05, 0.05), col, inX * inY);
+    } else if (fr > 4.5 && fr < 5.5) {
+        // Classic full white print border.
+        float bw = 0.06 * fS;
+        float inX = step(bw, vFrameUV.x) * step(vFrameUV.x, 1.0 - bw);
+        float inY = step(bw, vFrameUV.y) * step(vFrameUV.y, 1.0 - bw);
+        col = mix(vec3(0.97, 0.965, 0.95), col, inX * inY);
+    } else if (fr > 5.5) {
+        // Full black gallery border.
+        float bw = 0.06 * fS;
+        float inX = step(bw, vFrameUV.x) * step(vFrameUV.x, 1.0 - bw);
+        float inY = step(bw, vFrameUV.y) * step(vFrameUV.y, 1.0 - bw);
+        col = mix(vec3(0.04, 0.04, 0.045), col, inX * inY);
     }
 
     // ---------- date stamp overlay ----------

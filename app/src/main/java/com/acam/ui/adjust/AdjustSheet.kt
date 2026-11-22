@@ -1,7 +1,10 @@
 package com.acam.ui.adjust
 
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -10,11 +13,14 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Tab
@@ -27,6 +33,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -87,7 +95,7 @@ fun AdjustSheet(vm: CameraViewModel, sheet: SheetUiState) {
                     .heightIn(max = maxH)
                     .verticalScroll(
                         when (sheet.mainTab.intValue) {
-                            0 -> sheet.scrolls[sheet.lookTab.intValue.coerceIn(0, 4)]
+                            0 -> sheet.scrolls[sheet.lookTab.intValue.coerceIn(0, 5)]
                             1 -> sheet.scrolls[5]
                             2 -> sheet.scrolls[6]
                             else -> sheet.scrolls[7]
@@ -189,9 +197,27 @@ private fun LookTab(vm: CameraViewModel, sheet: SheetUiState) {
         Param("Color depth", 2f, 255f, { it.colorDepth.toFloat() }, { p, v -> p.copy(colorDepth = v.toInt().coerceIn(2, 255)) }, { String.format(Locale.US, "%.0f", it) }),
         Param("Dithering", 0f, 1f, { it.dither }, { p, v -> p.copy(dither = v) })
     )
+    val stylizeParams = listOf(
+        Param("Hue shift", -0.5f, 0.5f, { it.hue }, { p, v -> p.copy(hue = v) }),
+        Param("Vibrance", -1f, 1f, { it.vibrance }, { p, v -> p.copy(vibrance = v) })
+    )
+    val splitParams = listOf(
+        Param("Split-tone amount", 0f, 1f, { it.splitAmount }, { p, v -> p.copy(splitAmount = v) }),
+        Param("Shadow hue", 0f, 1f, { it.splitShadowHue }, { p, v -> p.copy(splitShadowHue = v) }),
+        Param("Highlight hue", 0f, 1f, { it.splitHighlightHue }, { p, v -> p.copy(splitHighlightHue = v) })
+    )
+    val duoParams = listOf(
+        Param("Duotone amount", 0f, 1f, { it.duotoneAmount }, { p, v -> p.copy(duotoneAmount = v) }),
+        Param("Dark ink hue", 0f, 1f, { it.duoDarkHue }, { p, v -> p.copy(duoDarkHue = v) }),
+        Param("Light ink hue", 0f, 1f, { it.duoLightHue }, { p, v -> p.copy(duoLightHue = v) })
+    )
+    val screenParams = listOf(
+        Param("Pixelate", 0f, 1f, { it.pixelate }, { p, v -> p.copy(pixelate = v) }),
+        Param("Halftone", 0f, 1f, { it.halftone }, { p, v -> p.copy(halftone = v) })
+    )
 
     TabRow(selectedTabIndex = sheet.lookTab.intValue) {
-        listOf("Color", "Tone", "Film", "Lens", "Retro").forEachIndexed { i, title ->
+        listOf("Color", "Tone", "Film", "Lens", "Retro", "Stylize").forEachIndexed { i, title ->
             Tab(
                 selected = sheet.lookTab.intValue == i,
                 onClick = { sheet.lookTab.intValue = i },
@@ -232,31 +258,41 @@ private fun LookTab(vm: CameraViewModel, sheet: SheetUiState) {
             SectionHeader("Lens")
             lensParams.forEach { slider(it) }
         }
-        else -> {
+        4 -> {
             SectionHeader("Retro digital")
             digitalParams.forEach { slider(it) }
 
-            SectionHeader("Frame & stamp")
+            SectionHeader("Frame")
             Segmented(
-                options = listOf("No frame", "Polaroid", "Film strip"),
-                selected = when (state.params.frame) {
-                    FrameStyle.NONE -> 0
-                    FrameStyle.POLAROID -> 1
-                    FrameStyle.FILM_STRIP -> 2
-                },
+                options = listOf("None", "Polaroid", "Film strip"),
+                selected = if (state.params.frame.ordinal <= 2) state.params.frame.ordinal else -1,
                 onSelect = { i ->
-                    vm.updateParams {
-                        it.copy(frame = when (i) {
-                            0 -> FrameStyle.NONE
-                            1 -> FrameStyle.POLAROID
-                            else -> FrameStyle.FILM_STRIP
-                        })
-                    }
+                    vm.updateParams { it.copy(frame = FrameStyle.entries[i.coerceIn(0, 2)]) }
                 },
                 modifier = Modifier.fillMaxWidth()
             )
+            Spacer(Modifier.height(6.dp))
+            Segmented(
+                options = listOf("Thin W", "Thin B", "Print", "Dark"),
+                selected = if (state.params.frame.ordinal >= 3) state.params.frame.ordinal - 3 else -1,
+                onSelect = { i ->
+                    vm.updateParams { it.copy(frame = FrameStyle.entries[i + 3]) }
+                },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Hint("Print = classic white photo border, Dark = black gallery border.")
+            ValueSlider(
+                label = "Border thickness",
+                value = state.params.frameScale,
+                onValueChange = { v -> vm.updateParams { it.copy(frameScale = v) } },
+                min = 0.5f,
+                max = 2f,
+                defaultValue = defaults.frameScale
+            )
+
+            SectionHeader("Date stamp")
             ToggleRow(
-                title = "Orange date stamp",
+                title = "Date stamp",
                 checked = state.params.dateStamp,
                 onChange = { on -> vm.updateParams { it.copy(dateStamp = on) } }
             )
@@ -273,7 +309,75 @@ private fun LookTab(vm: CameraViewModel, sheet: SheetUiState) {
                     modifier = Modifier.fillMaxWidth()
                 )
                 Hint("Date patterns like 'MMM d, yyyy  h:mm a' are rendered live; any literal text works too.")
+
+                Hint("Corner")
+                Segmented(
+                    options = listOf("Top L", "Top R", "Bot L", "Bot R"),
+                    selected = state.dateStamp.corner.let { c ->
+                        when (c) { 0 -> 0; 3 -> 1; 2 -> 2; else -> 3 }
+                    },
+                    onSelect = { i ->
+                        vm.updateDateStamp { cfg ->
+                            cfg.copy(corner = when (i) { 0 -> 0; 1 -> 3; 2 -> 2; else -> 1 })
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                )
+
+                Hint("Stamp color")
+                val swatches = listOf(
+                    0xFFFF8A00L, 0xFFFFD400L, 0xFFFF3B30L, 0xFFFF2D95L,
+                    0xFF34C759L, 0xFF00C7D4L, 0xFF007AFFL, 0xFFFFFFFFL, 0xFF000000L
+                )
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    modifier = Modifier.padding(top = 6.dp)
+                ) {
+                    swatches.forEach { argb ->
+                        val selectedColor = state.dateStamp.colorArgb == argb
+                        Box(
+                            modifier = Modifier
+                                .size(30.dp)
+                                .clip(CircleShape)
+                                .background(Color(argb.toLong()))
+                                .border(
+                                    width = if (selectedColor) 3.dp else 1.dp,
+                                    color = if (selectedColor) MaterialTheme.colorScheme.primary
+                                    else MaterialTheme.colorScheme.outline,
+                                    shape = CircleShape
+                                )
+                                .clickable {
+                                    vm.updateDateStamp { cfg -> cfg.copy(colorArgb = argb) }
+                                }
+                        )
+                    }
+                }
             }
+        }
+        else -> {
+            SectionHeader("Stylize")
+            stylizeParams.forEach { slider(it) }
+
+            SectionHeader("Split tone")
+            Hint("Tint shadows and highlights with separate hues; a classic teal/orange grade is shadow 0.55, highlight 0.08.")
+            splitParams.forEach { slider(it) }
+
+            SectionHeader("Duotone")
+            Hint("Maps the image's brightness to two ink colors - try Game Boy or Blueprint to see it.")
+            duoParams.forEach { slider(it) }
+
+            SectionHeader("Screen effects")
+            Hint("Pixelate makes real mosaic blocks; halftone is a rotated dot-screen print pattern.")
+            screenParams.forEach { slider(it) }
+
+            SectionHeader("Feeling lucky?")
+            OutlinedButton(
+                onClick = { vm.shuffleLook() },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Shuffle look")
+            }
+            Hint("Randomizes color, tone, split-tone, duotone and texture knobs in tasteful bounds. Reset from the preset menu to go back.")
         }
     }
 }

@@ -47,12 +47,15 @@ class EffectProgram(kind: SrcKind = SrcKind.TEX2D) {
     private val uColor0 = GLES20.glGetUniformLocation(program, "uColor0")
     private val uColor1 = GLES20.glGetUniformLocation(program, "uColor1")
     private val uColor2 = GLES20.glGetUniformLocation(program, "uColor2")
+    private val uColor3 = GLES20.glGetUniformLocation(program, "uColor3")
+    private val uColor4 = GLES20.glGetUniformLocation(program, "uColor4")
     private val uMixR = GLES20.glGetUniformLocation(program, "uMixR")
     private val uMixG = GLES20.glGetUniformLocation(program, "uMixG")
     private val uMixB = GLES20.glGetUniformLocation(program, "uMixB")
     private val uFilm0 = GLES20.glGetUniformLocation(program, "uFilm0")
     private val uFilm1 = GLES20.glGetUniformLocation(program, "uFilm1")
     private val uFilm2 = GLES20.glGetUniformLocation(program, "uFilm2")
+    private val uFilm3 = GLES20.glGetUniformLocation(program, "uFilm3")
     private val uLens0 = GLES20.glGetUniformLocation(program, "uLens0")
     private val uLens1 = GLES20.glGetUniformLocation(program, "uLens1")
 
@@ -90,12 +93,15 @@ class EffectProgram(kind: SrcKind = SrcKind.TEX2D) {
         GLES20.glUniform4f(uColor0, p.exposure, p.contrast, p.brightness, p.saturation)
         GLES20.glUniform4f(uColor1, p.temperature, p.tint, p.highlights, p.shadows)
         GLES20.glUniform4f(uColor2, p.blackPoint, p.toneCurve, p.bwAmount, p.sepiaAmount)
+        GLES20.glUniform4f(uColor3, p.hue, p.vibrance, p.splitAmount, p.duotoneAmount)
+        GLES20.glUniform4f(uColor4, p.splitShadowHue, p.splitHighlightHue, p.duoDarkHue, p.duoLightHue)
         GLES20.glUniform4f(uMixR, p.mixerRR, p.mixerRG, p.mixerRB, 0f)
         GLES20.glUniform4f(uMixG, p.mixerGR, p.mixerGG, p.mixerGB, 0f)
         GLES20.glUniform4f(uMixB, p.mixerBR, p.mixerBG, p.mixerBB, 0f)
         GLES20.glUniform4f(uFilm0, p.grainAmount, p.grainSize, p.grainColor, p.colorNoise)
         GLES20.glUniform4f(uFilm1, p.bloom, p.dust, p.lightLeak, p.lightLeakType.toFloat())
         GLES20.glUniform4f(uFilm2, p.scanlines, p.jpegBlocking, p.colorDepth.toFloat(), p.dither)
+        GLES20.glUniform4f(uFilm3, p.pixelate, p.halftone, p.frameScale, 0f)
         GLES20.glUniform4f(uLens0, p.sharpness, p.vignette, p.vignetteSize, p.aberration)
         GLES20.glUniform4f(
             uLens1, p.distortion,
@@ -103,6 +109,10 @@ class EffectProgram(kind: SrcKind = SrcKind.TEX2D) {
                 FrameStyle.NONE -> 0f
                 FrameStyle.POLAROID -> 1f
                 FrameStyle.FILM_STRIP -> 2f
+                FrameStyle.THIN_WHITE -> 3f
+                FrameStyle.THIN_BLACK -> 4f
+                FrameStyle.FULL_WHITE -> 5f
+                FrameStyle.FULL_BLACK -> 6f
             },
             if (p.dateStamp) 1f else 0f,
             0f

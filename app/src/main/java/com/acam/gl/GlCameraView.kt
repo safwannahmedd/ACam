@@ -31,7 +31,10 @@ class PipeConfig(
     /** Live viewfinder zoom (user pinch). Applied DIGITALLY by the renderer
      *  on viewfinder sessions (see [GlPipe.viewfinderHwZoom] and the 1.2.5
      *  fix in onDrawFrame); the still capture keeps its own hardware zoom. */
-    val zoom: Float = 1f
+    val zoom: Float = 1f,
+    /** Date stamp corner: 0 top-left, 1 bottom-right, 2 bottom-left,
+     *  3 top-right (from DateStampConfig.corner). */
+    val stampCorner: Int = 1
 )
 
 /** Recording configuration, resolved (encoder-clamped) by the view model. */
@@ -587,7 +590,7 @@ class GlPipe(private val appContext: Context) {
             GLES20.glViewport(0, 0, ew, eh)
 
             // ---- date stamp placement ----
-            computeStampRect(cfg.params, stampBmpW, stampBmpH)
+            computeStampRect(cfg.params, cfg.stampCorner, stampBmpW, stampBmpH)
 
             fx.use()
             bindSource(cpuMode)
@@ -1005,7 +1008,7 @@ class GlPipe(private val appContext: Context) {
                 val fbo = ensureOfflineFbo(outW, outH)
                 fbo.bind()
                 GLES20.glViewport(0, 0, outW, outH)
-                computeStampRect(cfg.params, stampBmpW, stampBmpH)
+                computeStampRect(cfg.params, cfg.stampCorner, stampBmpW, stampBmpH)
 
                 p2d.use()
                 GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
@@ -1087,17 +1090,24 @@ class GlPipe(private val appContext: Context) {
             GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         }
 
-        private fun computeStampRect(p: EffectParams, bw: Int, bh: Int) {
-            // Orange stamp tint is baked into the bitmap; keep alpha full.
+        private fun computeStampRect(p: EffectParams, corner: Int, bw: Int, bh: Int) {
+            // Stamp tint is baked into the bitmap; keep the multiply white.
             stampColorArr[0] = 1f
             stampColorArr[1] = 1f
             stampColorArr[2] = 1f
             stampColorArr[3] = 1f
             val hUv = 0.075f
             val wUv = hUv * (bw.toFloat() / bh.toFloat())
+            val side = 0.05f
+            // Bottom placements sit just above the polaroid's thick bottom band.
             val bottomMargin = if (p.frame == FrameStyle.POLAROID) 0.20f else 0.075f
-            stampRectArr[0] = 1f - wUv - 0.05f
-            stampRectArr[1] = 1f - hUv - bottomMargin
+            // Top placements mirror the bottom margins (no thick top band on
+            // any frame style, so a plain margin is enough).
+            val topMargin = if (p.frame == FrameStyle.POLAROID) 0.10f else 0.075f
+            val left = corner == 0 || corner == 2
+            val top = corner == 0 || corner == 3
+            stampRectArr[0] = if (left) side else 1f - wUv - side
+            stampRectArr[1] = if (top) topMargin else 1f - hUv - bottomMargin
             stampRectArr[2] = wUv
             stampRectArr[3] = hUv
         }
