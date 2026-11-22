@@ -146,6 +146,43 @@ class GlPipe(private val appContext: Context) {
      *  controller's analyzer thread publishes, the GL thread consumes. */
     private val cpuFrameSlot = AtomicReference<Bitmap?>(null)
 
+    // ---- tap-to-focus support (the 1.2.7 fix) ----
+    // The exact UV chain of the last drawn frame, latched for inversion.
+    // Two pre-allocated buffers: the GL thread fills the idle one and flips
+    // the index, readers snapshot the published one - no per-frame
+    // allocation, no lock on the render path.
+    private val uvLatch = arrayOf(FloatArray(16), FloatArray(16))
+    @Volatile private var uvLatchIdx = 0
+    @Volatile private var uvLatchValid = false
+
+    /** GL thread: publish the frame's UV chain (target uv -> buffer uv). */
+    internal fun latchUvMatrix(m: FloatArray) {
+        val w = 1 - uvLatchIdx
+        System.arraycopy(m, 0, uvLatch[w], 0, 16)
+        uvLatchIdx = w
+        uvLatchValid = true
+    }
+
+    /** Invert the last drawn frame's UV chain: target-frame uv (GL-natural,
+     *  v = 0 at the frame BOTTOM) -> source-buffer uv ((0,0) = the buffer's
+     *  top-left, the coordinate system SurfaceOrientedMeteringPointFactory
+     *  expects). Whatever the device's SurfaceTexture transform, the sensor
+     *  rotation, the digital zoom, the mirror or the CPU fallback did to the
+     *  viewfinder, this returns the exact buffer pixel under the user's
+     *  finger. Returns null before the first frame (or on a degenerate
+     *  chain). Safe from any thread. */
+    fun mapTargetToStream(u: Float, v: Float): Pair<Float, Float>? {
+        if (!uvLatchValid) return null
+        val m = uvLatch[uvLatchIdx]
+        val a = m[0]; val b = m[4]
+        val c = m[1]; val d = m[5]
+        val det = a * d - b * c
+        if (java.lang.Math.abs(det) < 1e-9f) return null
+        val x = u - m[12]
+        val y = v - m[13]
+        return ((d * x - b * y) / det) to ((a * y - c * x) / det)
+    }
+
     /** Controller (analyzer thread): publish one converted viewfinder
      *  frame. A not-yet-consumed older frame is simply dropped (GC). */
     fun pushCpuFrame(frame: Bitmap) {
@@ -476,8 +513,28 @@ class GlPipe(private val appContext: Context) {
             // (SENSOR_ORIENTATION says "rotate the buffer clockwise by this
             // angle to be upright"; a clockwise image rotation is a
             // counter-clockwise UV rotation, so the matrix gets (360-rot)).
-            val rot = ((cfg.sensorOrientation - cfg.displayRotation) % 360 + 360) % 360
-            val (csx, csy) = Framing.cropScale(streamW, streamH, rot, cfg.outW, cfg.outH)
+            //
+            // THE 1.2.7 ROTATION FIX: a class of camera stacks hands the
+            // SurfaceTexture a transform that ALREADY carries the sensor
+            // rotation - a transpose-type matrix (2x2 part dominated by the
+            // off-diagonal) instead of the plain Y flip. The buffer these
+            // stacks deliver is pre-rotated, and the transform is the
+            // producer's own instruction for reading it upright. The old
+            // chain assumed base = flipY and applied R((360-rot)) on top,
+            // double-rotating the viewfinder by 90 degrees on exactly those
+            // devices while photos stayed correct (they render from the
+            // JPEG's own rotationDegrees, which CameraX had already set to
+            // the pre-rotated truth). Detection is per-frame, so a HAL that
+            // changes its mind mid-stream is followed transparently. When
+            // the transform owns the rotation, R becomes the identity and
+            // the crop is computed on the ROTATED (upright) stream dims -
+            // the stream as seen THROUGH the transform.
+            val stRotates = !cpuMode && stMatTransposed()
+            val rot = if (stRotates) 0
+                else ((cfg.sensorOrientation - cfg.displayRotation) % 360 + 360) % 360
+            val cropW = if (stRotates) streamH else streamW
+            val cropH = if (stRotates) streamW else streamH
+            val (csx, csy) = Framing.cropScale(cropW, cropH, rot, cfg.outW, cfg.outH)
             // THE 1.2.5 ZOOM FIX: the viewfinder zooms DIGITALLY - the
             // sampled window shrinks by the zoom factor around the center,
             // uniformly on both axes so the output aspect (and therefore the
@@ -504,6 +561,11 @@ class GlPipe(private val appContext: Context) {
                 Mat4.mulInto(uvTmp, rotMat, cropMat)             // R * C
                 Mat4.mulInto(uvMat, baseMat, uvTmp)              // B * R * C
             }
+            // Latch the exact chain (target uv -> buffer uv) so view taps
+            // can be inverted into metering pixels - whatever the device's
+            // transform, the zoom, the mirror or the fallback mode did to
+            // this frame (see [GlPipe.mapTargetToStream]).
+            latchUvMatrix(uvMat)
 
             // ---- choose effect target size ----
             val exact = capturePending || recorder != null ||
@@ -677,6 +739,18 @@ class GlPipe(private val appContext: Context) {
                 )
                 System.arraycopy(Mat4.flipY(), 0, m, 0, 16)
             }
+        }
+
+        /** True when the current SurfaceTexture transform is transpose-type:
+         *  its 2x2 part is dominated by the off-diagonal, meaning the
+         *  producer already applied the sensor rotation to the buffer and
+         *  encoded it in the transform. Healthy camera stacks return a
+         *  Y-flip (diagonal). Must be called after getTransformMatrix +
+         *  [sanitizeStMat] so the matrix under test is the real one. */
+        private fun stMatTransposed(): Boolean {
+            val diag = Math.abs(stMat[0]) + Math.abs(stMat[5])
+            val off = Math.abs(stMat[1]) + Math.abs(stMat[4])
+            return off > diag
         }
 
         /** Bind the live source + overlay to their fixed units:

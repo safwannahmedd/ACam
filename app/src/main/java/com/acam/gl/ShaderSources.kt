@@ -28,16 +28,26 @@ package com.acam.gl
  */
 object ShaderSources {
 
-    /** Shared vertex shader. The quad is a full clip-space triangle strip. */
+    /** Shared vertex shader. The quad is a full clip-space triangle strip.
+     *
+     *  vUV is the SOURCE sampling coordinate (post uTexMatrix); vFrameUV
+     *  (the 1.2.7 fix) is the raw OUTPUT-frame coordinate: y = 0 at the
+     *  image bottom, y = 1 at the top, in every render path (the photo
+     *  pass flips the quad positions, not the UVs). Frame decorations
+     *  (polaroid border, film strip) must be computed from vFrameUV so
+     *  their widths never depend on the camera crop and the viewfinder
+     *  shows literally the saved photo. */
     const val VERTEX = """
 attribute vec4 aPosition;
 attribute vec2 aUV;
 uniform mat4 uPosMatrix;
 uniform mat4 uTexMatrix;
 varying vec2 vUV;
+varying vec2 vFrameUV;
 void main() {
     gl_Position = uPosMatrix * aPosition;
     vUV = (uTexMatrix * vec4(aUV, 0.0, 1.0)).xy;
+    vFrameUV = aUV;
 }
 """
 
@@ -83,6 +93,7 @@ void main() {
      */
     private const val EFFECTS_BODY = """
 varying vec2 vUV;
+varying vec2 vFrameUV;      // output-frame uv, y = 0 at the image bottom
 
 uniform sampler2D uOverlay;        // date stamp bitmap (white on transparent)
 uniform vec2 uSize;                // output size in pixels
@@ -333,21 +344,29 @@ void main() {
     col = clamp(col, 0.0, 1.0);
 
     // ---------- border / frame ----------
+    // THE 1.2.7 FIX: drawn in OUTPUT-frame space (vFrameUV), never in
+    // source-uv space. The old code tested vUV, so the border widths
+    // scaled with the camera center-crop and drifted between the
+    // viewfinder and the saved photo: a 1:1 output cropped from a 4:3
+    // stream lost the top border entirely and squashed the thick
+    // polaroid bottom to a sliver - "boundary cut off". Frame space is
+    // identical in every render path, so preview, photo and video all
+    // show the exact same, designed frame.
     float fr = uLens1.y;
     if (fr > 0.5 && fr < 1.5) {
-        // Polaroid: white border, thicker at the bottom.
+        // Polaroid: thin white border top/left/right, thicker at the bottom.
         float bw = 0.045;
         float bb = 0.155;
-        float inX = step(bw, uv.x) * step(uv.x, 1.0 - bw);
-        float inY = step(bw, uv.y) * step(uv.y, 1.0 - bb);
+        float inX = step(bw, vFrameUV.x) * step(vFrameUV.x, 1.0 - bw);
+        float inY = step(bb, vFrameUV.y) * step(vFrameUV.y, 1.0 - bw);
         col = mix(vec3(0.965, 0.960, 0.940), col, inX * inY);
     } else if (fr > 1.5) {
         // Film strip: dark bands with sprocket holes.
         float tb = 0.115;
-        float band = step(uv.y, tb) + step(1.0 - tb, uv.y);
-        float fx = fract(uv.x * 10.0);
-        float fyT = step(tb * 0.25, uv.y) * step(uv.y, tb * 0.75);
-        float fyB = step(1.0 - tb * 0.75, uv.y) * step(uv.y, 1.0 - tb * 0.25);
+        float band = step(vFrameUV.y, tb) + step(1.0 - tb, vFrameUV.y);
+        float fx = fract(vFrameUV.x * 10.0);
+        float fyT = step(tb * 0.25, vFrameUV.y) * step(vFrameUV.y, tb * 0.75);
+        float fyB = step(1.0 - tb * 0.75, vFrameUV.y) * step(vFrameUV.y, 1.0 - tb * 0.25);
         float hole = step(0.28, fx) * step(fx, 0.72) * max(fyT, fyB);
         col = mix(col, vec3(0.07, 0.065, 0.06), band * (1.0 - hole));
     }

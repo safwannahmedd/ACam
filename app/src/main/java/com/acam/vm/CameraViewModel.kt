@@ -877,7 +877,16 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---------------------------------------------------------- focus
 
-    /** Tap-to-focus: view coords -> stream coords, then CameraX metering. */
+    /** Tap-to-focus: view coords -> stream coords, then CameraX metering.
+     *
+     *  THE 1.2.7 FIX: the tap is mapped by inverting the EXACT UV chain of
+     *  the last drawn frame (GlPipe.mapTargetToStream), so the metering
+     *  point is correct for every viewfinder shape - classic sensor-oriented
+     *  streams, devices whose SurfaceTexture transform already carries the
+     *  sensor rotation, the CPU-frame fallback, digital zoom and the front
+     *  mirror alike. The old pure-math inverse hard-coded the flipY base
+     *  transform and drifted 90 degrees on exactly the devices that needed
+     *  the new detection. */
     fun focusAt(viewX: Float, viewY: Float, viewW: Float, viewH: Float) {
         val s = _state.value
         if (s.vfSystem) {
@@ -885,21 +894,13 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             controller?.focusAtView(viewX, viewY)
             return
         }
-        val caps = s.caps ?: return
         val size = resolvedSize(s)
-        val rot = ((caps.sensorOrientation - s.displayRotation) % 360 + 360) % 360
-        val (csx, csy) = Framing.cropScale(pipe.streamW, pipe.streamH, rot, size.w, size.h)
-        // Match the renderer's zoom window (digital zoom on viewfinder-only
-        // sessions - the 1.2.5 fix): a tap on the visible frame lands inside
-        // the zoomed window by construction, exactly as before.
-        val zoom = if (pipe.viewfinderHwZoom) 1f else s.cameraPrefs.zoom.coerceAtLeast(1f)
-        val mirror = caps.isFront && s.cameraPrefs.mirrorFront
-        val uv = Framing.viewToStream(
+        val uv = Framing.viewToFrameUv(
             viewX, viewY, viewW, viewH,
-            size.w.toFloat(), size.h.toFloat(),
-            rot, mirror, csx / zoom, csy / zoom
+            size.w.toFloat(), size.h.toFloat()
         ) ?: return
-        controller?.focusAt(uv.first * pipe.streamW, uv.second * pipe.streamH)
+        val buf = pipe.mapTargetToStream(uv.first, uv.second) ?: return
+        controller?.focusAt(buf.first * pipe.streamW, buf.second * pipe.streamH)
     }
 
     fun setZoom(ratio: Float) {

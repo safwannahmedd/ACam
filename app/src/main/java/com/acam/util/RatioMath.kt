@@ -207,25 +207,20 @@ object Framing {
     }
 
     /**
-     * Map a view tap (view pixels, top-left origin) to stream pixels
-     * (sensor-oriented buffer, (0,0) = top-left of the buffer, which is
-     * what CameraX metering expects).
-     * Returns null when the tap is outside the letterboxed frame.
-     *
-     * This is the EXACT inverse of the renderer's UV chain
-     * FLIP_Y * R((360-rot)%360) * C * M applied to GL-natural target uv
-     * (v = 0 = image bottom), derived corner by corner and locked in by
-     * the unit tests. See Mat4's docs for why the rotation direction is
-     * inverted versus the image-space rotation.
+     * View tap -> target-frame uv in GL-natural orientation (v = 0 at the
+     * frame BOTTOM), inside the letterboxed frame the renderer blits to
+     * the view. Returns null when the tap is outside the frame. This is
+     * the orientation-independent first half of [viewToStream]; the exact
+     * stream mapping is then done by inverting the renderer's own UV
+     * chain (see GlPipe.mapTargetToStream) so it stays correct on every
+     * device - including the ones whose SurfaceTexture transform already
+     * carries the sensor rotation (the 1.2.7 fix).
      */
-    fun viewToStream(
+    fun viewToFrameUv(
         x: Float, y: Float, viewW: Float, viewH: Float,
-        frameW: Float, frameH: Float,
-        rotationDeg: Int, mirror: Boolean,
-        cropX: Float, cropY: Float
+        frameW: Float, frameH: Float
     ): Pair<Float, Float>? {
         if (viewW <= 0f || viewH <= 0f || frameW <= 0f || frameH <= 0f) return null
-        if (cropX <= 0f || cropY <= 0f) return null
         val va = viewW / viewH
         val fa = frameW / frameH
         val cw: Float
@@ -242,7 +237,39 @@ object Framing {
         if (x < ox || x > ox + cw || y < oy || y > oy + ch) return null
         val u = (x - ox) / cw               // target x, left..right
         val ty = (y - oy) / ch              // target y, top..bottom
-        val v = 1f - ty                     // GL-natural: v = 0 at bottom
+        return u to (1f - ty)               // GL-natural: v = 0 at bottom
+    }
+
+    /**
+     * Map a view tap (view pixels, top-left origin) to stream pixels
+     * (sensor-oriented buffer, (0,0) = top-left of the buffer, which is
+     * what CameraX metering expects).
+     * Returns null when the tap is outside the letterboxed frame.
+     *
+     * This is the EXACT inverse of the renderer's UV chain
+     * FLIP_Y * R((360-rot)%360) * C * M applied to GL-natural target uv
+     * (v = 0 = image bottom), derived corner by corner and locked in by
+     * the unit tests. See Mat4's docs for why the rotation direction is
+     * inverted versus the image-space rotation.
+     *
+     * NOTE (1.2.7): the live renderer now follows the device's actual
+     * SurfaceTexture transform, which on some stacks already includes the
+     * sensor rotation; the UI layer therefore maps taps through
+     * [viewToFrameUv] + GlPipe.mapTargetToStream (the inverted real chain)
+     * instead. This function remains the pure, unit-tested reference for
+     * the classic sensor-oriented chain.
+     */
+    fun viewToStream(
+        x: Float, y: Float, viewW: Float, viewH: Float,
+        frameW: Float, frameH: Float,
+        rotationDeg: Int, mirror: Boolean,
+        cropX: Float, cropY: Float
+    ): Pair<Float, Float>? {
+        val frameUv = viewToFrameUv(x, y, viewW, viewH, frameW, frameH)
+            ?: return null
+        val u = frameUv.first                    // target x, left..right
+        val v = frameUv.second                   // GL-natural: v = 0 at bottom
+        if (cropX <= 0f || cropY <= 0f) return null
         val mu = if (mirror) 1f - u else u
         // Crop: target uv -> full-upright uv (the same forward crop the
         // shader applies when sampling; cs < 1 narrows the sampled region).
