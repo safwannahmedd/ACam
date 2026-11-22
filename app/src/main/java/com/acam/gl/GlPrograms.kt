@@ -1,5 +1,6 @@
 package com.acam.gl
 
+import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import com.acam.data.EffectParams
 import com.acam.data.FrameStyle
@@ -10,12 +11,9 @@ enum class SrcKind {
     /** Plain RGBA texture: full-resolution photo render (decoded JPEG). */
     TEX2D,
 
-    /** Live viewfinder, planar YUV (I420): Y/U/V luminance textures. */
-    YUV_PLANAR,
-
-    /** Live viewfinder, semi-planar YUV (NV12/NV21): Y + interleaved
-     *  LUMINANCE_ALPHA chroma texture. */
-    YUV_SEMI
+    /** Live viewfinder: the CameraX Preview SurfaceTexture as a
+     *  GL_TEXTURE_EXTERNAL_OES. */
+    OES
 }
 
 /**
@@ -24,8 +22,8 @@ enum class SrcKind {
  * effects shader. The [SrcKind] selects which sampling prologue the program
  * is built from; the effects body is byte-identical in every variant.
  *
- * Texture units: 0 = Y (or the RGBA photo texture), 1 = U / interleaved
- * chroma, 2 = V, 3 = date-stamp overlay.
+ * Texture units: 0 = camera source (OES external texture for the live
+ * viewfinder, plain RGBA for the photo render), 3 = date-stamp overlay.
  */
 class EffectProgram(kind: SrcKind = SrcKind.TEX2D) {
 
@@ -33,8 +31,7 @@ class EffectProgram(kind: SrcKind = SrcKind.TEX2D) {
         ShaderSources.VERTEX,
         when (kind) {
             SrcKind.TEX2D -> ShaderSources.EFFECTS_FRAGMENT_2D
-            SrcKind.YUV_PLANAR -> ShaderSources.EFFECTS_FRAGMENT_YUV_PLANAR
-            SrcKind.YUV_SEMI -> ShaderSources.EFFECTS_FRAGMENT_YUV_SEMI
+            SrcKind.OES -> ShaderSources.EFFECTS_FRAGMENT_OES
         }
     )
 
@@ -61,54 +58,19 @@ class EffectProgram(kind: SrcKind = SrcKind.TEX2D) {
 
     // Source-specific uniforms.
     private val uTex = GLES20.glGetUniformLocation(program, "uTex")
-    private val uTexY = GLES20.glGetUniformLocation(program, "uTexY")
-    private val uTexU = GLES20.glGetUniformLocation(program, "uTexU")
-    private val uTexV = GLES20.glGetUniformLocation(program, "uTexV")
-    private val uTexC = GLES20.glGetUniformLocation(program, "uTexC")
-    private val uYuvScale = GLES20.glGetUniformLocation(program, "uYuvScale")
-    private val uFirstIsU = GLES20.glGetUniformLocation(program, "uFirstIsU")
+    private val uTexOes = GLES20.glGetUniformLocation(program, "uTexOes")
 
     init {
         // Sampler unit assignments are constant for the program's lifetime.
         GLES20.glUseProgram(program)
         when (kind) {
             SrcKind.TEX2D -> GLES20.glUniform1i(uTex, 0)
-            SrcKind.YUV_PLANAR -> {
-                GLES20.glUniform1i(uTexY, 0)
-                GLES20.glUniform1i(uTexU, 1)
-                GLES20.glUniform1i(uTexV, 2)
-            }
-            SrcKind.YUV_SEMI -> {
-                GLES20.glUniform1i(uTexY, 0)
-                GLES20.glUniform1i(uTexC, 1)
-            }
+            SrcKind.OES -> GLES20.glUniform1i(uTexOes, 0)
         }
         GLES20.glUniform1i(uOverlay, 3)
     }
 
     fun use() = GLES20.glUseProgram(program)
-
-    /**
-         * Upload the plane-scale uniform for YUV variants. For TEX2D it is a
-         * no-op. scale = (imageW / yTexW, 1, chromaW / cTexW, 1).
-         *
-         * Binds the program first: this can be called right after a frame
-         * upload, when a different program (e.g. the blit) is current.
-         */
-    fun setYuvScale(scale: FloatArray) {
-        if (uYuvScale >= 0) {
-            GLES20.glUseProgram(program)
-            GLES20.glUniform4fv(uYuvScale, 1, scale, 0)
-        }
-    }
-
-    /** Which byte of the interleaved chroma texel is U (semi-planar only). */
-    fun setFirstIsU(firstIsU: Boolean) {
-        if (uFirstIsU >= 0) {
-            GLES20.glUseProgram(program)
-            GLES20.glUniform1f(uFirstIsU, if (firstIsU) 1f else 0f)
-        }
-    }
 
     /**
      * Upload all effect parameters. Called once per frame; all values are
@@ -186,6 +148,41 @@ class BlitProgram {
         GLES20.glVertexAttribPointer(aUV, 2, GLES20.GL_FLOAT, false, 16, quad)
         GLES20.glEnableVertexAttribArray(aUV)
         GLES20.glUniformMatrix4fv(uPosMatrix, 1, false, posMatrix, 0)
+        GLES20.glUniformMatrix4fv(uTexMatrix, 1, false, Mat4.identity(), 0)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+}
+
+/**
+ * Raw external-texture blit (SurfaceTexture -> probe FBO). Same vertex
+ * layout as [BlitProgram]; the sampler is a samplerExternalOES, so the
+ * texture must be bound to GL_TEXTURE_EXTERNAL_OES. Draws with plain
+ * identity matrices - the probe only needs pixel statistics, not
+ * orientation.
+ */
+class OesBlitProgram {
+
+    val program: Int = GlUtils.link(ShaderSources.VERTEX, ShaderSources.OES_BLIT_FRAGMENT)
+
+    private val aPosition = GLES20.glGetAttribLocation(program, "aPosition")
+    private val aUV = GLES20.glGetAttribLocation(program, "aUV")
+    private val uPosMatrix = GLES20.glGetUniformLocation(program, "uPosMatrix")
+    private val uTexMatrix = GLES20.glGetUniformLocation(program, "uTexMatrix")
+    private val uTex = GLES20.glGetUniformLocation(program, "uTex")
+
+    fun use() = GLES20.glUseProgram(program)
+
+    fun draw(quad: FloatBuffer, tex: Int) {
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex)
+        GLES20.glUniform1i(uTex, 0)
+        quad.position(0)
+        GLES20.glVertexAttribPointer(aPosition, 2, GLES20.GL_FLOAT, false, 16, quad)
+        GLES20.glEnableVertexAttribArray(aPosition)
+        quad.position(2)
+        GLES20.glVertexAttribPointer(aUV, 2, GLES20.GL_FLOAT, false, 16, quad)
+        GLES20.glEnableVertexAttribArray(aUV)
+        GLES20.glUniformMatrix4fv(uPosMatrix, 1, false, Mat4.identity(), 0)
         GLES20.glUniformMatrix4fv(uTexMatrix, 1, false, Mat4.identity(), 0)
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }

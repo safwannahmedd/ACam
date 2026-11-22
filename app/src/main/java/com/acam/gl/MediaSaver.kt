@@ -163,7 +163,7 @@ object PhotoSaver {
                 ExifInterface.TAG_DATETIME,
                 SimpleDateFormat("yyyy:MM:dd HH:mm:ss", Locale.US).format(Date())
             )
-            exif.setAttribute(ExifInterface.TAG_SOFTWARE, "ACam 1.0")
+            exif.setAttribute(ExifInterface.TAG_SOFTWARE, "ACam 1.2.1")
             exif.saveAttributes()
         }
     }

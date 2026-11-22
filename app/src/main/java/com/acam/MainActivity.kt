@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.view.KeyEvent
 import android.view.Surface
 import android.view.WindowManager
+import android.util.Size
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
@@ -74,11 +75,32 @@ class MainActivity : ComponentActivity() {
         controller = CameraController(this, this, vm.pipe)
         vm.controller = controller
         controller.prefsProvider = { vm.state.value.cameraPrefs }
+        // Single-stream ("compatible") capture mode: bound by default, can
+        // be turned off for devices whose HAL handles simultaneous streams.
+        controller.compatProvider = { vm.state.value.ui.compatCapture }
         // Stabilization lives with the video settings and is re-applied
         // from them on every bind, so it survives restarts.
         controller.stabilizationProvider = { vm.state.value.video.stabilization }
+        // Display rotation for the Preview use case's target rotation.
+        controller.displayRotationProvider = { vm.state.value.displayRotation }
+        // Viewfinder reliability: start the resolution ladder at the last
+        // rung the probe declared healthy, and engage the persisted CPU-frame
+        // compatibility viewfinder without re-running the whole ladder.
+        controller.savedPreviewProvider = {
+            val ui = vm.state.value.ui
+            if (ui.previewW > 0 && ui.previewH > 0) {
+                Size(ui.previewW, ui.previewH)
+            } else null
+        }
+        controller.cpuPrefProvider = { vm.state.value.ui.vfCpuMode }
+        controller.systemVfPrefProvider = { vm.state.value.ui.vfSystemMode }
+        controller.onVfSystem = { on -> vm.onVfSystem(on) }
+        controller.onPreviewRungHealthy = { w, h -> vm.savePreviewRung(w, h) }
+        controller.onVfCompat = { on -> vm.onVfCompat(on) }
         controller.onCapsChanged = { caps -> vm.onCaps(caps) }
         controller.onEntriesChanged = { entries, active -> vm.onLensEntries(entries, active) }
+        controller.onStreamSuspect = { suspect -> vm.onStreamSuspect(suspect) }
+        controller.onAnalysisFallback = { size -> vm.onAnalysisFallback(size) }
         controller.onError = { msg -> android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show() }
 
         // Keep the pipeline informed about display rotation.
@@ -99,7 +121,18 @@ class MainActivity : ComponentActivity() {
             }
         }
         dm.registerDisplayListener(displayListener, null)
-        vm.setDisplayRotation(0)
+        // Seed the rotation with the CURRENT display state instead of
+        // assuming portrait: the listener only fires on changes, so a
+        // landscape-held start would otherwise carry a wrong rotation
+        // (and a wrong viewfinder orientation) until the first change.
+        vm.setDisplayRotation(
+            when (windowManager.defaultDisplay.rotation) {
+                Surface.ROTATION_90 -> 90
+                Surface.ROTATION_180 -> 180
+                Surface.ROTATION_270 -> 270
+                else -> 0
+            }
+        )
 
         cameraGranted = ContextCompat.checkSelfPermission(
             this, Manifest.permission.CAMERA

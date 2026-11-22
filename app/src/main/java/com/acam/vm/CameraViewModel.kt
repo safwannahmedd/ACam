@@ -62,7 +62,26 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         val countdown: Int? = null,
         val flashOverlay: Boolean = false,
         val lastSaved: Uri? = null,
-        val toast: String? = null
+        val toast: String? = null,
+
+        /** Live viewfinder stream was declared degenerate by the probe:
+         *  the HAL fed perfectly flat frames at every resolution. */
+        val streamSuspect: Boolean = false,
+
+        /** The viewfinder is running in compatibility mode (CPU-converted
+         *  frames) - working, but softer than the GL preview path. */
+        val vfCompat: Boolean = false,
+
+        /** The viewfinder is running on the system PreviewView (last
+         *  resort after every GL path failed). Photos keep effects. */
+        val vfSystem: Boolean = false,
+
+        /** Non-null while the camera diagnostics suite is running; the
+         *  string is the current test label. */
+        val diagRunning: String? = null,
+
+        /** Final diagnostics result, shown once. */
+        val diagResult: String? = null
     ) {
         val activePreset: Preset?
             get() = presets.firstOrNull { it.id == activePresetId }
@@ -599,20 +618,30 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             if (flash) delay(450)
             _state.update { it.copy(flashOverlay = true) }
             val controller = controller
-            if (controller != null && controller.imageCaptureReady) {
-                controller.takePicture(
+            if (controller != null && !s.recording && !controller.diagnosticsRunning) {
+                // Single-stream (compatible) capture: the still use case is
+                // bound alone for the shot and the viewfinder rebinds after.
+                // While recording, no rebind happens - the photo comes from
+                // the live stream instead.
+                //
+                // The flash LED is turned off in the COMPLETION callbacks,
+                // never on a timer: the rebind + settle alone takes ~600ms,
+                // so a fixed timer would cut the LED before the sensor
+                // actually exposes and flash photos would come out dark.
+                controller.captureStill(
                     displayRotation = s.displayRotation,
                     onResult = { jpeg, rot, crop ->
+                        if (flash) controller.startCaptureFlash(false)
                         decodeOfflineCapture(jpeg, rot, crop)
                     },
-                    onError = { fallbackStreamCapture() }
+                    onError = {
+                        if (flash) controller.startCaptureFlash(false)
+                        fallbackStreamCapture()
+                    }
                 )
             } else {
+                if (flash) controller?.startCaptureFlash(false)
                 fallbackStreamCapture()
-            }
-            if (flash) {
-                delay(500)
-                controller?.startCaptureFlash(false)
             }
         }
     }
@@ -658,6 +687,78 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /** Live-stream probe verdict from the controller. */
+    fun onStreamSuspect(suspect: Boolean) {
+        _state.update { it.copy(streamSuspect = suspect) }
+    }
+
+    /** The viewfinder switched to (or back from) the CPU-frame
+     *  compatibility mode; persist the engagement so the next launch skips
+     *  the slow degenerate ladder. */
+    fun onVfCompat(on: Boolean) {
+        _state.update { it.copy(vfCompat = on) }
+        if (on) {
+            updateUi { it.copy(vfCpuMode = true) }
+        } else {
+            updateUi { it.copy(vfCpuMode = false) }
+        }
+    }
+
+    /** The viewfinder switched to (or back from) the system PreviewView
+     *  (the last-resort rung). Persisted so the next launch skips straight
+     *  to a working viewfinder. */
+    fun onVfSystem(on: Boolean) {
+        _state.update { it.copy(vfSystem = on) }
+        updateUi { it.copy(vfSystemMode = on) }
+        if (on) {
+            _state.update { it.copy(toast = "Using the system viewfinder for this camera") }
+        }
+    }
+
+    /** Manual switch (Settings toggle). */
+    fun setSystemViewfinder(on: Boolean) {
+        controller?.setSystemViewfinder(on)
+        // setSystemViewfinder fires onVfSystem, which updates the state;
+        // also persist immediately for the case where no camera is bound.
+        updateUi { it.copy(vfSystemMode = on) }
+        if (!on) {
+            _state.update { it.copy(vfSystem = false) }
+        }
+    }
+
+    /** The probe declared this preview rung healthy - remember it as the
+     *  next launch's starting rung. */
+    fun savePreviewRung(w: Int, h: Int) {
+        if (w <= 0 || h <= 0) return
+        val s = _state.value
+        if (s.ui.previewW == w && s.ui.previewH == h) return
+        updateUi { it.copy(previewW = w, previewH = h) }
+    }
+
+    /** The viewfinder auto-switched to a fallback resolution. */
+    fun onAnalysisFallback(size: android.util.Size) {
+        _state.update { it.copy(toast = "Viewfinder switched to ${size.width}x${size.height} for compatibility") }
+    }
+
+    /** Run the on-device camera diagnostics suite (Settings). */
+    fun runDiagnostics() {
+        val controller = controller ?: return
+        if (_state.value.diagRunning != null) return
+        _state.update { it.copy(diagRunning = "Starting…", diagResult = null) }
+        controller.runDiagnostics(
+            onProgress = { label ->
+                _state.update { it.copy(diagRunning = label) }
+            },
+            onDone = { summary ->
+                _state.update { it.copy(diagRunning = null, diagResult = summary) }
+            }
+        )
+    }
+
+    fun consumeDiagResult() {
+        _state.update { it.copy(diagResult = null) }
+    }
+
     // ------------------------------------------------------------ video
 
     private fun hasMic(): Boolean =
@@ -688,6 +789,13 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     fun startRecording() {
         val s = _state.value
         if (s.recording) return
+        if (s.vfSystem) {
+            // Video records the GL effects pipeline; the system viewfinder
+            // exists only because that pipeline could not be fed on this
+            // device. There is no frame source to record from.
+            _state.update { it.copy(toast = "Video is unavailable while the system viewfinder is active") }
+            return
+        }
         val size = resolvedSize(s)
         val (encW, encH) = encoderClampFor(size.w, size.h)
         val bitrate = if (s.video.autoBitrate) {
@@ -734,6 +842,11 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     /** Tap-to-focus: view coords -> stream coords, then CameraX metering. */
     fun focusAt(viewX: Float, viewY: Float, viewW: Float, viewH: Float) {
         val s = _state.value
+        if (s.vfSystem) {
+            // System viewfinder: the PreviewView knows its own transform.
+            controller?.focusAtView(viewX, viewY)
+            return
+        }
         val caps = s.caps ?: return
         val size = resolvedSize(s)
         val rot = ((caps.sensorOrientation - s.displayRotation) % 360 + 360) % 360

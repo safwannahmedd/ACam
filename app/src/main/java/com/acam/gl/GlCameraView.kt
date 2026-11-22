@@ -3,11 +3,14 @@ package com.acam.gl
 import android.content.Context
 import android.graphics.Bitmap
 import android.opengl.EGL14
+import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
-import androidx.camera.core.ImageProxy
+import android.util.Size
 import com.acam.data.EffectParams
 import com.acam.data.FrameStyle
 import com.acam.util.Framing
@@ -68,12 +71,20 @@ sealed class RecordEvent {
  * writes configuration and enqueues commands; the renderer reads them once
  * per frame. Nothing here allocates per frame.
  *
- * The live viewfinder frames arrive as YUV_420_888 ImageProxys from the
- * CameraX ImageAnalysis use case (the most universally supported camera
- * output format) and are uploaded to plain GL textures - the same texture
- * model as the full-resolution photo path, so the WYSIWYG guarantee holds
- * by construction: viewfinder and saved photo share one shader, one matrix
- * chain (FLIP_Y * R * C) and one framing math.
+ * THE LIVE SOURCE (1.2.1): the CameraX Preview use case composes frames
+ * straight into a SurfaceTexture owned by this pipeline, which the renderer
+ * consumes as a GL_TEXTURE_EXTERNAL_OES.
+ *
+ * THE HANDSHAKE LATCH (1.2.2): the SurfaceTexture created on the GL thread
+ * is stored here the moment it exists ([currentSurfaceTexture]) AND pushed
+ * through [onSurfaceTexture]. The camera controller pulls the latch at bind
+ * time in addition to listening for the push, so the controller can never
+ * end up waiting forever for a notification that was fired before it
+ * subscribed - the 1.2.1 "viewfinder never shows a frame" race: on devices
+ * where CameraX init is slower than GL surface creation, the push fired
+ * into a null listener and no Preview was ever bound. The view then never
+ * drew anything and showed the window surface's uninitialized memory
+ * (a flat, session-dependent gray/green field).
  */
 class GlPipe(private val appContext: Context) {
 
@@ -84,8 +95,69 @@ class GlPipe(private val appContext: Context) {
     @Volatile var streamH: Int = 0
         internal set
 
+    /** Wall clock (elapsedRealtime) of the last stream (re)start - a new
+     *  SurfaceTexture, a new SurfaceRequest or a ladder resize. The probe
+     *  grants the camera this long to deliver its first frame before a
+     *  "frozen" verdict may count. */
+    @Volatile var streamResetAtMs: Long = SystemClock.elapsedRealtime()
+        private set
+
+    /** Latched live-source SurfaceTexture (GL thread writes, anyone reads). */
+    @Volatile private var liveSt: android.graphics.SurfaceTexture? = null
+
+    /** The pipeline's current live-source SurfaceTexture, or null while the
+     *  GL context has not created one yet. Safe from any thread. */
+    fun currentSurfaceTexture(): android.graphics.SurfaceTexture? = liveSt
+
+    /** Mark that a new camera stream is being set up (grace timer reset). */
+    fun noteStreamReset() {
+        streamResetAtMs = SystemClock.elapsedRealtime()
+    }
+
+    /**
+     * True while the viewfinder runs on CPU-converted frames pushed by the
+     * camera controller - the fallback of last resort, engaged only after
+     * every GL-preview resolution was declared degenerate. Set by the
+     * controller; read by the renderer on every frame.
+     */
+    @Volatile var cpuFallback: Boolean = false
+
+    /** Newest-wins slot for the CPU-converted viewfinder frame. The
+     *  controller's analyzer thread publishes, the GL thread consumes. */
+    private val cpuFrameSlot = AtomicReference<Bitmap?>(null)
+
+    /** Controller (analyzer thread): publish one converted viewfinder
+     *  frame. A not-yet-consumed older frame is simply dropped (GC). */
+    fun pushCpuFrame(frame: Bitmap) {
+        cpuFrameSlot.set(frame)
+        view?.requestRender()
+    }
+
+    /** GL thread: take the pending frame, if any. */
+    internal fun takeCpuFrame(): Bitmap? = cpuFrameSlot.getAndSet(null)
+
     /** Notified (GL thread) whenever the live stream size changes. */
     var onStreamSize: ((w: Int, h: Int) -> Unit)? = null
+
+    /**
+     * Notified (GL thread) when a (new) SurfaceTexture exists for the live
+     * source - once per GL context. The camera controller stores it and
+     * (re)binds the Preview use case to it.
+     */
+    var onSurfaceTexture: ((android.graphics.SurfaceTexture) -> Unit)? = null
+
+    /**
+     * Notified (GL thread) when the degenerate-stream probe concludes the
+     * camera is feeding unusable frames (flat / stale / frozen). The
+     * controller falls back down the preview resolution ladder.
+     */
+    var onStreamDegenerate: ((reason: String) -> Unit)? = null
+
+    /** Notified (GL thread) when the probe sees healthy frames again. */
+    var onStreamHealthy: (() -> Unit)? = null
+
+    /** Preview buffer size to start with (controller's ladder rung). */
+    @Volatile var previewSizeProvider: () -> Size = { Size(1280, 960) }
 
     var onPhoto: ((w: Int, h: Int, rgba: ByteArray) -> Unit)? = null
     var onRecordEvent: ((RecordEvent) -> Unit)? = null
@@ -94,8 +166,7 @@ class GlPipe(private val appContext: Context) {
 
     @Volatile internal var view: GLSurfaceView? = null
 
-    private val frameLock = Any()
-    private var pendingFrame: ImageProxy? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     private val t0Ms = SystemClock.elapsedRealtime()
 
@@ -115,31 +186,36 @@ class GlPipe(private val appContext: Context) {
     }
 
     /**
-     * Called by the ImageAnalysis analyzer thread for every new frame.
-     * O(1): swaps the single pending slot (closing any frame the GL thread
-     * has not consumed yet) and wakes the GL thread. KEEP_ONLY_LATEST
-     * backpressure: the camera delivers the next frame only after the GL
-     * thread closes this one.
+     * The controller reports the stream size the camera session actually
+     * settled on (from the Preview SurfaceRequest resolution). Sensor
+     * oriented, like everything else in the framing math.
      */
-    fun submitFrame(image: ImageProxy) {
-        if (image.width <= 0 || image.height <= 0) {
-            image.close()
-            return
+    fun setStreamSize(w: Int, h: Int) {
+        if (w <= 0 || h <= 0) return
+        var changed = false
+        synchronized(this) {
+            if (streamW != w || streamH != h) {
+                streamW = w
+                streamH = h
+                changed = true
+            }
         }
-        synchronized(frameLock) {
-            pendingFrame?.close()
-            pendingFrame = image
+        if (changed) {
+            noteStreamReset()
+            onStreamSize?.invoke(w, h)
         }
-        view?.requestRender()
     }
 
-    /** Drop an unconsumed frame (view detached). */
-    fun clearPending() {
-        synchronized(frameLock) {
-            pendingFrame?.close()
-            pendingFrame = null
-        }
+    /** New preview buffer size (ladder fallback) - safe from any thread. */
+    fun resizePreview(w: Int, h: Int) {
+        renderer.surfaceTexture?.setDefaultBufferSize(w, h)
+        setStreamSize(w, h)
     }
+
+    /** True while the live source exists but frames have stopped (or never
+     *  started): the view needs watchdog render ticks so the starved-frame
+     *  path (screen clear + frozen-stream probe) keeps executing. */
+    fun needsWatchdogRender(): Boolean = renderer.starved()
 
     val renderer = Renderer()
 
@@ -155,20 +231,55 @@ class GlPipe(private val appContext: Context) {
         private var mainFbo: GlUtils.Fbo? = null
         private var offlineFbo: GlUtils.Fbo? = null
 
-        // ---- live YUV source (GL thread only) ----
+        // ---- live external-texture source (GL thread only) ----
         private var liveProgram: EffectProgram? = null
-        private var liveKind: SrcKind? = null
-        private var texY = 0
-        private var texU = 0          // planar U | semi: interleaved chroma
-        private var texV = 0          // planar V only
-        private var yuvAllocated = false
-        private var yuvTexW = 0
-        private var yuvTexH = 0
-        private var cTexW = 0
-        private var cTexH = 0
-        private var semiPlanar = false
-        private var firstIsU = true
-        private val yuvScale = FloatArray(4)
+        @Volatile internal var surfaceTexture: android.graphics.SurfaceTexture? = null
+            internal set
+        private var oesTex = 0
+
+        // ---- CPU-frame fallback source (GL thread only) ----
+        private var cpuTex = 0
+        @Volatile private var haveCpuFrame = false
+
+        /** elapsedRealtime of the last CPU-frame upload; 0 until the first.
+         *  Drives the watchdog render tick while in fallback mode. */
+        @Volatile private var lastCpuAtMs = 0L
+
+        @Volatile private var frameArrived = false
+        private var framesReceived = 0L
+
+        /** elapsedRealtime of the last updateTexImage; 0 until the first
+         *  frame. Drives the watchdog render tick. */
+        @Volatile private var lastFrameAtMs = 0L
+
+        /** True when the live source exists but no frame has arrived for
+         *  over a second: the view is starved and onDrawFrame must keep
+         *  running (watchdog tick) so the probe can detect a frozen stream.
+         *  RENDERMODE_WHEN_DIRTY alone would stop drawing - and a probe that
+         *  only lives inside onDrawFrame can never notice its own absence. */
+        fun starved(): Boolean {
+            if (cpuFallback) {
+                if (!haveCpuFrame) return true
+                return SystemClock.elapsedRealtime() - lastCpuAtMs > 1000L
+            }
+            if (surfaceTexture == null) return false
+            if (lastFrameAtMs == 0L) return true
+            return SystemClock.elapsedRealtime() - lastFrameAtMs > 1000L
+        }
+
+        /** SurfaceTexture transform, refreshed after every updateTexImage. */
+        private val stMat = FloatArray(16).also { android.opengl.Matrix.setIdentityM(it, 0) }
+
+        // ---- degenerate-stream probe (GL thread only) ----
+        private var probeFbo: GlUtils.Fbo? = null
+        private var lastProbeAtMs = 0L
+        private var probeBadRun = 0
+        private var probeLastHash = 0L
+        private var probeHaveHash = false
+        private var probeFramesAtLast = -1L
+        private var probeWasBad = false
+        private val probeBuf =
+            ByteBuffer.allocateDirect(PROBE_W * PROBE_H * 4).order(ByteOrder.nativeOrder())
 
         /** Top-down flip for readbacks: renders the quad upside down so
          *  glReadPixels returns top-down rows with no extra copy. */
@@ -180,6 +291,7 @@ class GlPipe(private val appContext: Context) {
         )
 
         private val identity = Mat4.identity()
+        private val flipYMat = Mat4.flipY()
         private var haveFrame = false
         private var surfaceW = 1
         private var surfaceH = 1
@@ -216,18 +328,56 @@ class GlPipe(private val appContext: Context) {
             // A fresh context invalidates every previous object name; drop
             // them all so the next frame re-creates everything it needs.
             liveProgram = null
-            liveKind = null
             effects2D = null
-            texY = 0
-            texU = 0
-            texV = 0
             captureTex = 0
-            yuvAllocated = false
+            cpuTex = 0
+            haveCpuFrame = false
             mainFbo?.delete()
             mainFbo = null
             offlineFbo?.delete()
             offlineFbo = null
+            probeFbo?.delete()
+            probeFbo = null
             haveFrame = false
+            probeBadRun = 0
+            probeHaveHash = false
+            probeWasBad = false
+            lastProbeAtMs = 0L
+            probeFramesAtLast = -1L
+            createLiveSource()
+        }
+
+        /**
+         * Create the external-OES texture + SurfaceTexture for the live
+         * viewfinder and hand it to the camera controller. A previous
+         * SurfaceTexture (from a lost GL context) is released first; the
+         * controller rebinds the Preview use case onto the new one.
+         */
+        private fun createLiveSource() {
+            val old = surfaceTexture
+            surfaceTexture = null
+            runCatching { old?.release() }
+            if (oesTex != 0) GlUtils.deleteTexture(oesTex)
+
+            val tex = GlUtils.genOesTexture()
+            val st = android.graphics.SurfaceTexture(tex)
+            val sz = previewSizeProvider()
+            runCatching { st.setDefaultBufferSize(sz.width, sz.height) }
+            // Frame callbacks on the main looper: the handler work is a
+            // volatile flag set + requestRender, both cheap and thread-safe.
+            st.setOnFrameAvailableListener({
+                frameArrived = true
+                view?.requestRender()
+            }, mainHandler)
+            oesTex = tex
+            surfaceTexture = st
+            liveSt = st                      // latch for late subscribers
+            frameArrived = false
+            framesReceived = 0
+            lastFrameAtMs = 0L
+            noteStreamReset()
+            Log.i("GlPipe", "Live source: SurfaceTexture ${sz.width}x${sz.height} (OES)")
+            onSurfaceTexture?.invoke(st)
         }
 
         override fun onSurfaceChanged(gl: javax.microedition.khronos.opengles.GL10?, width: Int, height: Int) {
@@ -241,59 +391,89 @@ class GlPipe(private val appContext: Context) {
             val cfg = config.get()
             val blit = this.blit ?: return
             val quad = this.quad ?: return
+            val cpuMode = cpuFallback
+            val st = if (cpuMode) null else surfaceTexture
 
-            // ---- consume one live frame (if any) ----
-            val frame = synchronized(frameLock) {
-                val f = pendingFrame
-                pendingFrame = null
-                f
+            if (cpuMode) {
+                // ---- CPU-frame fallback: consume the newest converted frame ----
+                consumeCpuFrame()
+                if (!haveCpuFrame || streamW == 0 || streamH == 0) {
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                    GLES20.glViewport(0, 0, surfaceW, surfaceH)
+                    clearScreen()
+                    return
+                }
+            } else {
+                // ---- consume the newest camera frame, if any ----
+                if (frameArrived) {
+                    frameArrived = false
+                    if (st != null) {
+                        try {
+                            st.updateTexImage()
+                            st.getTransformMatrix(stMat)
+                            sanitizeStMat()
+                            framesReceived++
+                            haveFrame = true
+                            lastFrameAtMs = SystemClock.elapsedRealtime()
+                        } catch (t: Throwable) {
+                            Log.e("GlPipe", "updateTexImage failed", t)
+                        }
+                    }
+                }
+
+                if (st == null || !haveFrame || streamW == 0 || streamH == 0) {
+                    // Explicitly address the window surface: a previous frame
+                    // may have left the probe FBO bound, and clearing that
+                    // instead of the screen would leave stale pixels showing.
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                    GLES20.glViewport(0, 0, surfaceW, surfaceH)
+                    clearScreen()
+                    maybeProbe(quad, 0)
+                    return
+                }
             }
-            if (frame != null) {
+            var fx = if (cpuMode) effects2D else liveProgram
+            if (fx == null) {
                 try {
-                    uploadFrame(frame)
-                    haveFrame = true
+                    fx = if (cpuMode) {
+                        EffectProgram(SrcKind.TEX2D).also { effects2D = it }
+                    } else {
+                        EffectProgram(SrcKind.OES).also { liveProgram = it }
+                    }
                 } catch (t: Throwable) {
-                    Log.e("GlPipe", "YUV upload failed", t)
-                } finally {
-                    frame.close()
+                    Log.e("GlPipe", "effects program build failed", t)
+                    clearScreen()
+                    return
                 }
             }
 
-            if (!haveFrame || streamW == 0 || streamH == 0) {
-                clearScreen()
-                return
-            }
-            val effects = liveProgram
-
-            if (effects == null) {
-                clearScreen()
-                return
-            }
-
-            // ---- framing: FLIP_Y * R * C * M ----
-            // Identical chain to the offline photo render (the texture
-            // rows are top-down in both cases), which is what makes the
-            // viewfinder literally the saved photo.
-            //
-            // THE ROTATION DIRECTION IS THE INVERSE OF THE IMAGE-SPACE
-            // ROTATION: SENSOR_ORIENTATION says "rotate the buffer
-            // clockwise by this angle to be upright", and a clockwise
-            // image rotation is a counter-clockwise UV rotation, so the
-            // matrix gets (360 - rot). Getting this wrong mirrors the
-            // frame about its diagonal (the old "lines / garbage
-            // viewfinder" bug).
+            // ---- framing: ST * R * C * M ----
+            // Identical chain to the offline photo render except that the
+            // SurfaceTexture transform (ST) replaces FLIP_Y: it carries the
+            // producer's row order (a Y flip on every real device), while
+            // the buffer itself is still sensor-oriented, so the rotation
+            // direction stays the INVERSE of the image-space rotation
+            // (SENSOR_ORIENTATION says "rotate the buffer clockwise by this
+            // angle to be upright"; a clockwise image rotation is a
+            // counter-clockwise UV rotation, so the matrix gets (360-rot)).
             val rot = ((cfg.sensorOrientation - cfg.displayRotation) % 360 + 360) % 360
             val (csx, csy) = Framing.cropScale(streamW, streamH, rot, cfg.outW, cfg.outH)
             System.arraycopy(Mat4.rotation((360 - rot) % 360), 0, rotMat, 0, 16)
             System.arraycopy(Mat4.crop(csx, csy), 0, cropMat, 0, 16)
+            // The base transform: the (sanitized) SurfaceTexture transform
+            // on the OES path, the plain top-down flip on the CPU-frame path
+            // (row 0 of a GLUtils-uploaded bitmap lands at v = 0, exactly
+            // like the decoded-JPEG photo render - the chain the photo path
+            // already proves correct on every device).
+            val baseMat = if (cpuMode) flipYMat else stMat
             if (cfg.mirror) {
                 System.arraycopy(Mat4.mirror(), 0, mirrorMat, 0, 16)
                 Mat4.mulInto(uvTmp, cropMat, mirrorMat)          // C * M
                 Mat4.mulInto(uvMat2, rotMat, uvTmp)              // R * C * M
-                Mat4.mulInto(uvMat, Mat4.flipY(), uvMat2)        // F * R * C * M
+                Mat4.mulInto(uvMat, baseMat, uvMat2)             // B * R * C * M
             } else {
                 Mat4.mulInto(uvTmp, rotMat, cropMat)             // R * C
-                Mat4.mulInto(uvMat, Mat4.flipY(), uvTmp)         // F * R * C
+                Mat4.mulInto(uvMat, baseMat, uvTmp)              // B * R * C
             }
 
             // ---- choose effect target size ----
@@ -318,10 +498,10 @@ class GlPipe(private val appContext: Context) {
             // ---- date stamp placement ----
             computeStampRect(cfg.params, stampBmpW, stampBmpH)
 
-            effects.use()
-            bindLiveSource()
-            effects.setParams(cfg.params, ew, eh, nowSeconds(), stampColorArr, stampRectArr)
-            effects.draw(quad, identity, uvMat)
+            fx.use()
+            bindSource(cpuMode)
+            fx.setParams(cfg.params, ew, eh, nowSeconds(), stampColorArr, stampRectArr)
+            fx.draw(quad, identity, uvMat)
 
             // ---- recording submit (frame dropping => genuine low fps) ----
             val rec = recorder
@@ -374,190 +554,270 @@ class GlPipe(private val appContext: Context) {
                 capturePending = false
                 fbo.bind()
                 GLES20.glViewport(0, 0, ew, eh)
-                effects.use()
-                bindLiveSource()
-                effects.setParams(cfg.params, ew, eh, nowSeconds(), stampColorArr, stampRectArr)
-                effects.draw(quad, flipPos, uvMat)
+                fx.use()
+                bindSource(cpuMode)
+                fx.setParams(cfg.params, ew, eh, nowSeconds(), stampColorArr, stampRectArr)
+                fx.draw(quad, flipPos, uvMat)
                 readPhoto(ew, eh)
+            }
+
+            // ---- degenerate-stream probe: the exact pixels just shown ----
+            if (!cpuMode) maybeProbe(quad, fbo.tex)
+        }
+
+        /** Bind the active camera source + overlay to their fixed units:
+         *  0 = camera source, 3 = overlay. The source is the OES external
+         *  texture on the GL-preview path, the uploaded CPU-frame texture
+         *  on the fallback path. */
+        private fun bindSource(cpuMode: Boolean) {
+            if (cpuMode) {
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, cpuTex)
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE3)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, overlayTex)
+            } else {
+                bindLiveSource(oesTex, overlayTex)
             }
         }
 
-        /** Bind the live source textures + overlay to their fixed units:
-         *  0 = Y, 1 = U / interleaved chroma, 2 = V, 3 = overlay. */
-        private fun bindLiveSource() {
+        /**
+         * Upload the newest CPU-converted frame (if any) to its 2D texture.
+         * Called once per drawn frame while in fallback mode; returns true
+         * when a usable frame is (already) bound.
+         */
+        private fun consumeCpuFrame(): Boolean {
+            val bmp = takeCpuFrame() ?: return haveCpuFrame
+            try {
+                if (cpuTex == 0) cpuTex = GlUtils.genTexture(GLES20.GL_TEXTURE_2D)
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, cpuTex)
+                android.opengl.GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+                GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+                haveCpuFrame = true
+                lastCpuAtMs = SystemClock.elapsedRealtime()
+            } catch (t: Throwable) {
+                Log.e("GlPipe", "CPU frame upload failed", t)
+            } finally {
+                // The upload is synchronous; the bitmap is done.
+                runCatching { bmp.recycle() }
+            }
+            return haveCpuFrame
+        }
+
+        /**
+         * Validate the SurfaceTexture transform every frame, cheaply: it
+         * must be finite and map the unit square into a sane window. A
+         * class of budget GPU drivers has been observed handing out zero /
+         * NaN matrices, which collapse every UV to a single point - the
+         * "viewfinder is one flat colour while photos are fine" failure.
+         * A bad matrix is replaced with the standard camera transform
+         * (a Y flip), which is what healthy devices return anyway.
+         */
+        private fun sanitizeStMat() {
+            val m = stMat
+            for (v in m) {
+                if (!v.isFinite()) {
+                    Log.e("GlPipe", "SurfaceTexture transform has non-finite entries - substituting flipY")
+                    System.arraycopy(Mat4.flipY(), 0, m, 0, 16)
+                    return
+                }
+            }
+            // Column-major: uv' = [m0 m4; m1 m5] * uv + [m12; m13].
+            var minX = Float.MAX_VALUE; var maxX = -Float.MAX_VALUE
+            var minY = Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
+            for (cu in CU) for (cv in CU) {
+                val px = m[0] * cu + m[4] * cv + m[12]
+                val py = m[1] * cu + m[5] * cv + m[13]
+                if (px < minX) minX = px
+                if (px > maxX) maxX = px
+                if (py < minY) minY = py
+                if (py > maxY) maxY = py
+            }
+            // Healthy camera transforms (flip, crop-rect) map [0,1]^2 into
+            // roughly [0,1]; degenerate ones collapse to a point or fly off.
+            val bad = maxX < -0.05f || minX > 1.05f ||
+                maxY < -0.05f || minY > 1.05f ||
+                (maxX - minX) < 0.5f || (maxY - minY) < 0.5f
+            if (bad) {
+                Log.e(
+                    "GlPipe",
+                    "Degenerate SurfaceTexture transform (x:[${minX}..${maxX}] y:[${minY}..${maxY}]) - substituting flipY"
+                )
+                System.arraycopy(Mat4.flipY(), 0, m, 0, 16)
+            }
+        }
+
+        /** Bind the live source + overlay to their fixed units:
+         *  0 = camera OES texture, 3 = overlay. */
+        private fun bindLiveSource(oesTex: Int, overlayTex: Int) {
             GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texY)
-            GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
-            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, texU)
-            GLES20.glActiveTexture(GLES20.GL_TEXTURE2)
-            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, if (semiPlanar) 0 else texV)
+            GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTex)
             GLES20.glActiveTexture(GLES20.GL_TEXTURE3)
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, overlayTex)
         }
 
+        /** Run [runProbe] at most once per [PROBE_PERIOD_MS] of drawn
+         *  frames. Time-based (not frame-count-based) so that a starved
+         *  view - where draws only happen on the watchdog tick - still
+         *  probes often enough to detect the stall within seconds.
+         *  [srcTex] is the texture holding the frame the user just SAW
+         *  (the effects FBO), or 0 when there is nothing new to judge. */
+        private fun maybeProbe(quad: java.nio.FloatBuffer, srcTex: Int) {
+            val now = SystemClock.elapsedRealtime()
+            if (now - lastProbeAtMs < PROBE_PERIOD_MS) return
+            lastProbeAtMs = now
+            runProbe(quad, srcTex)
+        }
+
         /**
-         * Upload one YUV_420_888 frame into the plane textures.
+         * Cheap liveness check on the FINAL RENDERED VIEWFINDER PIXELS
+         * (the exact texture blitted to the screen this frame): a 32x24
+         * readback roughly once per [PROBE_PERIOD_MS].
          *
-         * Row strides are honored by allocating each texture rowStride
-         * bytes wide (the padding becomes extra, never-sampled columns)
-         * and scaling the sampling x coordinate by imageW/texW. The last
-         * row may be shorter than the stride, so it is uploaded as a
-         * separate one-row sub-image - both uploads read only bytes the
-         * plane buffer is guaranteed to hold.
+         * THE 1.2.4 FIX: the probe used to sample the RAW external
+         * (OES) texture through its own render pass. On budget GPU/HAL
+         * combos that render path disagreed with what the effects pass
+         * put on screen - the user stared at a perfectly flat or torn
+         * viewfinder while the probe happily read "healthy" pixels and
+         * the whole fallback ladder never engaged. The probe now judges
+         * the exact pixels the user sees, read back through the SAME
+         * plain-RGBA-FBO channel the photo capture already proves
+         * reliable on every device (readPhoto).
+         *
+         * Detects every failure mode seen in the field:
+         *  - FLAT non-black fields (exactly or near-uniform - budget HALs
+         *    have been observed writing a memset buffer, or the GPU's
+         *    external-texture sampling collapsing to one value),
+         *  - TORN / SMEARED buffers (near-constant rows that differ
+         *    wildly between rows),
+         *  - STALE frames (the exact same pixels re-rendered),
+         *  - FROZEN streams (no new frames at all).
+         * Black is legal (a dark room); only non-black flatness counts.
+         *
+         * A grace period after every stream (re)start keeps slow camera
+         * opens (budget HALs can take well over a second) from being
+         * misread as a freeze.
          */
-        private fun uploadFrame(image: ImageProxy) {
-            val planes = image.planes
-            if (planes.size < 3) {
-                Log.e("GlPipe", "YUV frame with ${planes.size} planes; dropped")
-                return
-            }
-            val w = image.width
-            val h = image.height
-            val yRow = planes[0].rowStride
-            val semi = planes[1].pixelStride == 2
-            val uRow = planes[1].rowStride
-            val vRow = planes[2].rowStride
-            // For semi-planar memory, the chroma plane whose buffer starts
-            // first owns the first byte of each texel.
-            val newFirstIsU = planes[1].buffer.position() <= planes[2].buffer.position()
+        private fun runProbe(quad: java.nio.FloatBuffer, srcTex: Int) {
+            // No live source (GL context never created one) -> nothing to
+            // judge; the controller has nothing bound anyway.
+            if (surfaceTexture == null) return
+            val framesNow = framesReceived
+            var bad = false
+            var reason = ""
 
-            val cw = (w + 1) / 2
-            val ch = (h + 1) / 2
-            val newTexW = yRow
-            val newTexH = h
-            val newCTexW = if (semi) uRow / 2 else uRow
-            val newCTexH = ch
-            if (newTexW < w || newCTexW < cw || newTexH < 1 || newCTexH < 1) {
-                Log.e("GlPipe", "Bad YUV layout: $w x $h, yRow=$yRow, cRow=$uRow, semi=$semi")
-                return
-            }
-            if (semi && uRow % 2 != 0) {
-                // An odd interleaved row stride cannot be mapped onto 2-byte
-                // texels; never observed in practice.
-                Log.e("GlPipe", "Odd chroma row stride $uRow; frame dropped")
-                return
-            }
-
-            GLES20.glPixelStorei(GLES20.GL_UNPACK_ALIGNMENT, 1)
-
-            if (!yuvAllocated || yuvTexW != newTexW || yuvTexH != newTexH ||
-                cTexW != newCTexW || cTexH != newCTexH || semiPlanar != semi
-            ) {
-                if (texY == 0) texY = GlUtils.genTexture(GLES20.GL_TEXTURE_2D)
-                if (texU == 0) texU = GlUtils.genTexture(GLES20.GL_TEXTURE_2D)
-                if (texV == 0) texV = GlUtils.genTexture(GLES20.GL_TEXTURE_2D)
-                allocPlane(texY, GLES20.GL_LUMINANCE, newTexW, newTexH)
-                if (semi) {
-                    allocPlane(texU, GLES20.GL_LUMINANCE_ALPHA, newCTexW, newCTexH)
-                } else {
-                    allocPlane(texU, GLES20.GL_LUMINANCE, newCTexW, newCTexH)
-                    allocPlane(texV, GLES20.GL_LUMINANCE, vRow, newCTexH)
+            if (framesNow == probeFramesAtLast) {
+                // No new frame since the previous probe. Only counts as
+                // "frozen" once the post-restart grace has elapsed; a
+                // freshly (re)bound camera legitimately needs time.
+                if (SystemClock.elapsedRealtime() - streamResetAtMs > FROZEN_GRACE_MS) {
+                    bad = true
+                    reason = "frozen"
                 }
-                yuvAllocated = true
-                yuvTexW = newTexW
-                yuvTexH = newTexH
-                cTexW = newCTexW
-                cTexH = newCTexH
-                semiPlanar = semi
-                Log.i(
-                    "GlPipe",
-                    "YUV layout: $w x $h, ${if (semi) "semi" else "planar"}, " +
-                        "yRow=$yRow, cRow=$uRow, firstIsU=$newFirstIsU"
-                )
-            }
-
-            // Compile (or recompile) the live program if the layout kind
-            // changed. Rare: at most once per device.
-            if (liveKind != (if (semi) SrcKind.YUV_SEMI else SrcKind.YUV_PLANAR)) {
-                liveProgram?.let { GLES20.glDeleteProgram(it.program) }
-                val kind = if (semi) SrcKind.YUV_SEMI else SrcKind.YUV_PLANAR
-                liveProgram = EffectProgram(kind)
-                liveKind = kind
-            }
-            val prog = liveProgram ?: return
-
-            // ---- luma plane ----
-            uploadPlane(planes[0].buffer, texY, GLES20.GL_LUMINANCE, yRow, h, w, 1)
-
-            // ---- chroma plane(s) ----
-            if (semi) {
-                // 2 bytes per texel; GL rows are uRow bytes == one buffer row.
-                uploadPlane(planes[1].buffer, texU, GLES20.GL_LUMINANCE_ALPHA, uRow, ch, cw * 2, 2)
             } else {
-                uploadPlane(planes[1].buffer, texU, GLES20.GL_LUMINANCE, uRow, ch, cw, 1)
-                uploadPlane(planes[2].buffer, texV, GLES20.GL_LUMINANCE, vRow, ch, cw, 1)
-            }
+                probeFramesAtLast = framesNow
+                if (srcTex > 0) {
+                    try {
+                        val blitProg = blit ?: return
+                        val fbo = probeFbo?.takeIf { it.w == PROBE_W && it.h == PROBE_H }
+                            ?: GlUtils.createFbo(PROBE_W, PROBE_H).also { probeFbo = it }
+                        fbo.bind()
+                        GLES20.glViewport(0, 0, PROBE_W, PROBE_H)
+                        blitProg.use()
+                        blitProg.draw(quad, srcTex, identity)
 
-            firstIsU = newFirstIsU
-            prog.setFirstIsU(firstIsU)
-            yuvScale[0] = w.toFloat() / yuvTexW
-            yuvScale[1] = 1f
-            yuvScale[2] = cw.toFloat() / cTexW
-            yuvScale[3] = 1f
-            prog.setYuvScale(yuvScale)
-
-            if (streamW != w || streamH != h) {
-                streamW = w
-                streamH = h
-                onStreamSize?.invoke(w, h)
-            }
-        }
-
-        /** (Re)specify a plane texture at the given size. */
-        private fun allocPlane(tex: Int, internalFormat: Int, w: Int, h: Int) {
-            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
-            GLES20.glTexImage2D(
-                GLES20.GL_TEXTURE_2D, 0, internalFormat, w, h, 0,
-                internalFormat, GLES20.GL_UNSIGNED_BYTE, null as ByteBuffer?
-            )
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
-            GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
-        }
-
-        /**
-         * Upload one plane whose buffer rows are [rowBytes] bytes apart
-         * into a texture allocated rowBytes bytes wide. [lastRowBytes] is
-         * the number of valid bytes in the final row (usually < rowBytes).
-         * [bytesPerTexel] converts row bytes to texture texels (1 for
-         * luminance planes, 2 for the interleaved LUMINANCE_ALPHA plane).
-         * All reads stay within the buffer's remaining bytes.
-         */
-        private fun uploadPlane(
-            buffer: ByteBuffer,
-            tex: Int,
-            format: Int,
-            rowBytes: Int,
-            rows: Int,
-            lastRowBytes: Int,
-            bytesPerTexel: Int
-        ) {
-            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
-            val base = buffer.position()
-            val available = buffer.remaining()
-            val widthMain = rowBytes / bytesPerTexel
-            if (rows > 1) {
-                val need = rowBytes.toLong() * (rows - 1)
-                if (need > available) {
-                    buffer.position(base)
-                    return
+                        probeBuf.position(0)
+                        probeBuf.limit(PROBE_W * PROBE_H * 4)
+                        GLES20.glReadPixels(
+                            0, 0, PROBE_W, PROBE_H,
+                            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, probeBuf
+                        )
+                        var minV = 255
+                        var maxV = 0
+                        var sum = 0L
+                        var hash = 0x811c9dc5L
+                        val rowSum = LongArray(PROBE_H)
+                        val rowSq = LongArray(PROBE_H)
+                        var idx = 0
+                        val n = PROBE_W * PROBE_H
+                        var i = 0
+                        while (i < n) {
+                            val v = probeBuf.get(idx).toInt() and 0xFF
+                            if (v < minV) minV = v
+                            if (v > maxV) maxV = v
+                            sum += v
+                            hash = (hash xor (v.toLong() * (i + 1))) * 0x01000193L and 0xFFFFFFFFL
+                            val r = i / PROBE_W
+                            rowSum[r] += v
+                            rowSq[r] += v.toLong() * v
+                            idx += 4
+                            i++
+                        }
+                        val mean = sum / n
+                        // Per-row structure: a torn / line-smeared buffer has
+                        // near-constant rows that differ wildly BETWEEN rows -
+                        // a shape no real scene produces (a flat wall makes all
+                        // rows equally flat; a real image varies within rows).
+                        var withinVar = 0.0
+                        var minRow = Double.MAX_VALUE
+                        var maxRow = -Double.MAX_VALUE
+                        for (r in 0 until PROBE_H) {
+                            val rm = rowSum[r].toDouble() / PROBE_W
+                            val rv = (rowSq[r].toDouble() / PROBE_W - rm * rm).coerceAtLeast(0.0)
+                            withinVar += rv
+                            if (rm < minRow) minRow = rm
+                            if (rm > maxRow) maxRow = rm
+                        }
+                        withinVar /= PROBE_H
+                        val rowSpread = maxRow - minRow
+                        // "flat": perfectly constant frame (a memset field from
+                        // the HAL). Real scenes at 32x24 essentially always vary
+                        // by at least two levels, even defocused flat walls.
+                        if (maxV - minV <= 1 && mean > 24) {
+                            bad = true
+                            reason = "flat (mean=$mean)"
+                        } else if (probeHaveHash && hash == probeLastHash) {
+                            bad = true
+                            reason = "stale"
+                        } else if (withinVar <= 4.0 && rowSpread > 24.0) {
+                            bad = true
+                            reason = "smeared rows (var=%.1f, spread=%.0f)".format(withinVar, rowSpread)
+                        }
+                        probeLastHash = hash
+                        probeHaveHash = true
+                    } catch (t: Throwable) {
+                        // The probe must never break the frame path.
+                        Log.w("GlPipe", "probe failed", t)
+                        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                        return
+                    }
                 }
-                buffer.position(base)
-                GLES20.glTexSubImage2D(
-                    GLES20.GL_TEXTURE_2D, 0, 0, 0,
-                    widthMain, rows - 1, format, GLES20.GL_UNSIGNED_BYTE, buffer
-                )
             }
-            val offset = rowBytes.toLong() * (rows - 1)
-            if (offset + lastRowBytes <= available) {
-                buffer.position(base + offset.toInt())
-                GLES20.glTexSubImage2D(
-                    GLES20.GL_TEXTURE_2D, 0, 0, rows - 1,
-                    lastRowBytes / bytesPerTexel, 1, format, GLES20.GL_UNSIGNED_BYTE, buffer
-                )
+
+            if (bad) {
+                probeBadRun++
+                if (probeBadRun >= PROBE_TRIGGER) {
+                    // No latch: after the controller rebinds at the next
+                    // ladder rung, a still-degenerate stream must be able
+                    // to report again and keep falling back.
+                    probeBadRun = 0
+                    Log.e("GlPipe", "Degenerate live stream: $reason")
+                    onStreamDegenerate?.invoke(reason)
+                }
+            } else {
+                probeBadRun = 0
+                if (probeWasBad) {
+                    onStreamHealthy?.invoke()
+                }
             }
-            buffer.position(base)
+            probeWasBad = bad
+
+            // Leave the pipeline on the window surface; a clearScreen in a
+            // later starved frame must hit the screen, not this probe FBO.
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
         }
 
         private fun clearScreen() {
@@ -783,14 +1043,47 @@ class GlPipe(private val appContext: Context) {
          *  cheaper). Photos and videos always render at the exact target. */
         const val PREVIEW_CAP = 1440
         private const val EGL10_CONFIG_ID = 0x3028
+
+        /** Degenerate-stream probe cadence: at most one probe per this many
+         *  milliseconds of drawn frames (healthy or watchdog-driven). */
+        private const val PROBE_PERIOD_MS = 500L
+
+        /** Consecutive bad probes before the stream is declared degenerate. */
+        private const val PROBE_TRIGGER = 3
+
+        /** Grace after a stream (re)start before "frozen" may be declared:
+         *  budget HALs legitimately need over a second to open + configure. */
+        private const val FROZEN_GRACE_MS = 2500L
+
+        private const val PROBE_W = 32
+        private const val PROBE_H = 24
+
+        /** Unit-square corner coordinates for the transform sanity check. */
+        private val CU = floatArrayOf(0f, 1f)
     }
 }
 
 /**
  * GLSurfaceView hosting the pipeline. ES 2.0 context: everything the
- * pipeline needs (planar luminance textures, FBOs, blits) is core ES 2.
+ * pipeline needs (the OES external texture, FBOs, blits) is core ES 2 +
+ * the mandatory GL_OES_EGL_image_external extension (required for
+ * SurfaceTexture, present on every Android GPU).
  */
 class GlCameraView(context: Context, val pipe: GlPipe) : GLSurfaceView(context) {
+
+    /** Keeps onDrawFrame alive while the camera delivers no frames, so the
+     *  frozen-stream probe can actually run (RENDERMODE_WHEN_DIRTY would
+     *  otherwise stop drawing - and with it all detection). The tick itself
+     *  is a clock read + two volatile reads at 2 Hz: free when healthy. */
+    private val watchdog = Handler(Looper.getMainLooper())
+    private val watchdogTick = object : Runnable {
+        override fun run() {
+            if (pipe.needsWatchdogRender()) {
+                requestRender()
+            }
+            watchdog.postDelayed(this, WATCHDOG_PERIOD_MS)
+        }
+    }
 
     init {
         setEGLContextClientVersion(2)
@@ -800,9 +1093,18 @@ class GlCameraView(context: Context, val pipe: GlPipe) : GLSurfaceView(context) 
         pipe.view = this
     }
 
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        watchdog.post(watchdogTick)
+    }
+
     override fun onDetachedFromWindow() {
-        super.onDetachedFromWindow()
-        pipe.clearPending()
+        watchdog.removeCallbacks(watchdogTick)
         if (pipe.view === this) pipe.view = null
+        super.onDetachedFromWindow()
+    }
+
+    private companion object {
+        private const val WATCHDOG_PERIOD_MS = 500L
     }
 }

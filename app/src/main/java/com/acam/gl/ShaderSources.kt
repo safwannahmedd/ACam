@@ -7,13 +7,24 @@ package com.acam.gl
  * GLSL ES 1.00. The camera source is sampled through the SAMPLE() macro so
  * the exact same effects body renders from either input:
  *
- *  - a plain GL_TEXTURE_2D (full-resolution photo render, decoded JPEG), or
- *  - the live YUV_420_888 viewfinder frames uploaded as planar textures
- *    (ImageAnalysis use case).
+ *  - the live viewfinder: CameraX Preview frames composited by the HAL into
+ *    a SurfaceTexture, consumed as a GL_TEXTURE_EXTERNAL_OES (the one
+ *    continuous camera path every HAL is factory-tuned for - the same
+ *    surface class the stock camera app renders to), or
+ *  - a plain GL_TEXTURE_2D (full-resolution photo render, decoded JPEG).
  *
  * Both variants are generated from EFFECTS_BODY below and can therefore
  * never drift apart: the shader that renders the saved photo is, line for
  * line, the shader the viewfinder runs.
+ *
+ * History: the viewfinder used to consume YUV_420_888 ImageAnalysis frames
+ * uploaded as planar textures. That path is CPU-copied and, on a class of
+ * budget camera HALs (UNISOC-class SoCs), the analysis stream itself
+ * delivers degenerate data (flat fields, half-written torn buffers) even as
+ * the same HAL composes perfectly good Preview surfaces and JPEG stills -
+ * the "flat / striped / zoomed viewfinder" bug. The external-texture path
+ * removes every one of those failure modes by construction: no plane
+ * strides, no pixel formats, no CPU copies.
  */
 object ShaderSources {
 
@@ -39,6 +50,23 @@ void main() {
 precision mediump float;
 varying vec2 vUV;
 uniform sampler2D uTex;
+void main() {
+    gl_FragColor = vec4(texture2D(uTex, vUV).rgb, 1.0);
+}
+"""
+
+    /**
+     * Raw external-texture blit (SurfaceTexture -> tiny probe FBO). Used
+     * only by the degenerate-frame probe, which needs the untouched camera
+     * pixels - no effects, no rotation, no crop. GL_TEXTURE_EXTERNAL_OES
+     * is the only texture target a SurfaceTexture can be bound to, so the
+     * standard blit program above cannot sample it.
+     */
+    const val OES_BLIT_FRAGMENT = """
+#extension GL_OES_EGL_image_external : require
+precision mediump float;
+varying vec2 vUV;
+uniform samplerExternalOES uTex;
 void main() {
     gl_FragColor = vec4(texture2D(uTex, vUV).rgb, 1.0);
 }
@@ -360,60 +388,16 @@ uniform sampler2D uTex;
 """ + EFFECTS_BODY
 
     /**
-     * Live viewfinder, planar YUV (I420): three GL_LUMINANCE textures.
-     * uYuvScale = (imageW / yTexW, 1, chromaW / uTexW, 1); the x scales
-     * remove row-stride padding so sampling is exact.
+     * Live viewfinder: the CameraX Preview SurfaceTexture bound to a
+     * GL_TEXTURE_EXTERNAL_OES. The SurfaceTexture transform (fetched via
+     * getTransformMatrix and composed by the renderer in place of the old
+     * FLIP_Y) takes care of the producer's row order; the renderer's UV
+     * chain still applies the sensor rotation, center crop and mirror on
+     * top of it, exactly as for a photo render.
      */
-    val EFFECTS_FRAGMENT_YUV_PLANAR = PRECISION_GUARD + """
-uniform sampler2D uTexY;
-uniform sampler2D uTexU;
-uniform sampler2D uTexV;
-uniform vec4 uYuvScale;
-vec3 yuvToRgb(float y, float u, float v) {
-    y = (y - 0.0627451) * 1.1643836;
-    u -= 0.5;
-    v -= 0.5;
-    return vec3(
-        y + 1.5960346 * v,
-        y - 0.3917623 * u - 0.8129676 * v,
-        y + 2.0172321 * u);
-}
-vec3 sampleYuv(vec2 uv) {
-    float y = texture2D(uTexY, vec2(uv.x * uYuvScale.x, uv.y)).r;
-    float u = texture2D(uTexU, vec2(uv.x * uYuvScale.z, uv.y)).r;
-    float v = texture2D(uTexV, vec2(uv.x * uYuvScale.z, uv.y)).r;
-    return yuvToRgb(y, u, v);
-}
-#define SAMPLE(uv) sampleYuv(uv)
-""" + EFFECTS_BODY
-
-    /**
-     * Live viewfinder, semi-planar YUV (NV12/NV21): luminance texture plus
-     * the interleaved chroma plane as GL_LUMINANCE_ALPHA (2 bytes per
-     * texel). uFirstIsU selects which byte is U: the plane whose buffer
-     * starts first owns the L channel.
-     */
-    val EFFECTS_FRAGMENT_YUV_SEMI = PRECISION_GUARD + """
-uniform sampler2D uTexY;
-uniform sampler2D uTexC;
-uniform vec4 uYuvScale;
-uniform float uFirstIsU;
-vec3 yuvToRgb(float y, float u, float v) {
-    y = (y - 0.0627451) * 1.1643836;
-    u -= 0.5;
-    v -= 0.5;
-    return vec3(
-        y + 1.5960346 * v,
-        y - 0.3917623 * u - 0.8129676 * v,
-        y + 2.0172321 * u);
-}
-vec3 sampleYuv(vec2 uv) {
-    float y = texture2D(uTexY, vec2(uv.x * uYuvScale.x, uv.y)).r;
-    vec4 c = texture2D(uTexC, vec2(uv.x * uYuvScale.z, uv.y));
-    float u = mix(c.a, c.r, uFirstIsU);
-    float v = mix(c.r, c.a, uFirstIsU);
-    return yuvToRgb(y, u, v);
-}
-#define SAMPLE(uv) sampleYuv(uv)
+    val EFFECTS_FRAGMENT_OES = """#extension GL_OES_EGL_image_external : require
+""" + PRECISION_GUARD + """
+uniform samplerExternalOES uTexOes;
+#define SAMPLE(uv) (texture2D(uTexOes, uv).rgb)
 """ + EFFECTS_BODY
 }

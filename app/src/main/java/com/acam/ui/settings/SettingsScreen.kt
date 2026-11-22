@@ -91,6 +91,16 @@ fun SettingsScreen(vm: CameraViewModel, onBack: () -> Unit) {
                 vm.updateUi { it.copy(showResBadge = on) }
             }
             com.acam.ui.components.Hint("The badge in the top-left corner of the viewfinder showing the current output size.")
+            ToggleRow("System viewfinder", state.ui.vfSystemMode) { on ->
+                vm.setSystemViewfinder(on)
+            }
+            com.acam.ui.components.Hint(
+                "Renders the live view with the platform's own camera view (the " +
+                    "path the stock camera app uses) instead of the effects pipeline. " +
+                    "Turn it ON if the preview ever shows flat, striped or frozen frames " +
+                    "while photos come out fine. Photos keep every effect either way; " +
+                    "video recording is unavailable in this mode."
+            )
 
             SectionHeader("Photos")
             Segmented(
@@ -113,9 +123,34 @@ fun SettingsScreen(vm: CameraViewModel, onBack: () -> Unit) {
                 )
             }
 
+            SectionHeader("Camera")
+            ToggleRow("Compatible capture", state.ui.compatCapture) { on ->
+                vm.updateUi { it.copy(compatCapture = on) }
+            }
+            com.acam.ui.components.Hint(
+                "Takes photos in a single-stream camera session: the viewfinder pauses " +
+                    "briefly while the shot is captured. This is the one session shape every " +
+                    "camera supports and fixes flat or striped frames on some devices. " +
+                    "Turn off only if your preview and photos both work fine and you want " +
+                    "faster shots."
+            )
+            Spacer(Modifier.height(8.dp))
+            androidx.compose.material3.OutlinedButton(
+                onClick = { vm.runDiagnostics() },
+                enabled = state.diagRunning == null,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(if (state.diagRunning == null) "Run camera diagnostics" else "Running…")
+            }
+            com.acam.ui.components.Hint(
+                "Binds several camera configurations and saves exactly what the camera " +
+                    "delivered (raw frames, planes, JPEGs) to Pictures/ACam-Diagnostics. " +
+                    "Use this if the preview looks wrong, then share that folder."
+            )
+
             SectionHeader("About")
             Text(
-                text = "ACam 1.1",
+                text = "ACam 1.2",
                 style = MaterialTheme.typography.titleMedium
             )
             Spacer(Modifier.height(6.dp))
@@ -155,6 +190,39 @@ fun SettingsScreen(vm: CameraViewModel, onBack: () -> Unit) {
                 vm.resetAll()
             },
             onDismiss = { resetOpen = false }
+        )
+    }
+
+    state.diagRunning?.let { label ->
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { },
+            title = { Text("Camera diagnostics") },
+            text = {
+                Column {
+                    Text(label)
+                    Spacer(Modifier.height(12.dp))
+                    androidx.compose.material3.LinearProgressIndicator(Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(12.dp))
+                    com.acam.ui.components.Hint(
+                        "Keep the app in the foreground; the viewfinder will pause. " +
+                            "This takes about half a minute."
+                    )
+                }
+            },
+            confirmButton = { }
+        )
+    }
+
+    state.diagResult?.let { result ->
+        androidx.compose.material3.AlertDialog(
+            onDismissRequest = { vm.consumeDiagResult() },
+            title = { Text("Diagnostics finished") },
+            text = { Text(result) },
+            confirmButton = {
+                androidx.compose.material3.TextButton(onClick = { vm.consumeDiagResult() }) {
+                    Text("OK")
+                }
+            }
         )
     }
 }

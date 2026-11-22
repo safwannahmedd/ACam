@@ -1,5 +1,6 @@
 package com.acam.gl
 
+import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.util.Log
 import java.nio.ByteBuffer
@@ -91,6 +92,32 @@ object GlUtils {
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        return ids[0]
+    }
+
+    /** Texture for a SurfaceTexture consumer (the live viewfinder source).
+     *  Must be bound to GL_TEXTURE_EXTERNAL_OES; LINEAR filtering over
+     *  camera buffers is supported by every Android GPU. */
+    fun genOesTexture(): Int {
+        val ids = IntArray(1)
+        GLES20.glGenTextures(1, ids, 0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, ids[0])
+        GLES20.glTexParameteri(
+            GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+            GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR
+        )
+        GLES20.glTexParameteri(
+            GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+            GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR
+        )
+        GLES20.glTexParameteri(
+            GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+            GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE
+        )
+        GLES20.glTexParameteri(
+            GLES11Ext.GL_TEXTURE_EXTERNAL_OES,
+            GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE
+        )
         return ids[0]
     }
 

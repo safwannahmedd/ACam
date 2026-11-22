@@ -176,7 +176,29 @@ data class UiPrefs(
     val photoFormat: PhotoFormat = PhotoFormat.JPEG,
     val jpegQuality: Int = 92,
     val countdownBeep: Boolean = true,
-    val showResBadge: Boolean = true
+    val showResBadge: Boolean = true,
+    /** Single-stream camera sessions: the viewfinder and the still capture
+     *  never run at the same time. The one session shape every camera HAL
+     *  supports; fixes flat/striped frames on budget devices at the cost of
+     *  a brief viewfinder freeze while a photo is taken. */
+    val compatCapture: Boolean = true,
+    /** Last viewfinder resolution the stream probe declared healthy. The
+     *  viewfinder ladder starts here on the next launch (0x0 = none yet),
+     *  so a device that had to fall back does not re-live the fallback in
+     *  front of the user every time the app opens. */
+    val previewW: Int = 0,
+    val previewH: Int = 0,
+    /** Compatibility viewfinder: CPU-converted frames instead of the GL
+     *  preview path. Engaged automatically only after EVERY preview
+     *  resolution was declared degenerate by the probe; makes the next
+     *  launch skip the slow ladder. Cleared by Reset all settings. */
+    val vfCpuMode: Boolean = false,
+    /** System viewfinder: the live view is rendered by a PreviewView (the
+     *  stock-camera compositor path) instead of the GL pipeline. Engaged
+     *  automatically only after the CPU rung was ALSO declared degenerate;
+     *  makes the next launch skip straight to a working viewfinder. Photos
+     *  keep all effects either way. Cleared by Reset all settings. */
+    val vfSystemMode: Boolean = false
 )
 
 /**

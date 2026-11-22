@@ -9,3 +9,4 @@ build/
 *.keystore
 *.jks
 keystore.properties
+acam-release.keystore

@@ -15,8 +15,13 @@ android {
         applicationId = "com.acam"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.1.0"
+        // Versioning rule (user-defined, applies from 1.2.0 on):
+        //   Every fix/update increments X: A.B.X -> A.B.(X+1).
+        //   When X reaches 10: X rolls to 0 and B increments.
+        //   When B reaches 10: B rolls to 0 and A increments.
+        //   versionCode is simply +1 per release (9 -> 1.2.3 -> 1.2.4).
+        versionCode = 10
+        versionName = "1.2.4"
     }
 
     buildTypes {
@@ -86,6 +91,9 @@ dependencies {
     implementation(libs.androidx.camera.core)
     implementation(libs.androidx.camera.camera2)
     implementation(libs.androidx.camera.lifecycle)
+    // PreviewView: the platform rendering path used by the system
+    // viewfinder (the last-resort compatibility rung, 1.2.4).
+    implementation(libs.androidx.camera.view)
 
     // Persistence: DataStore + kotlinx.serialization (JSON)
     implementation(libs.androidx.datastore.preferences)

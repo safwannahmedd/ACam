@@ -152,6 +152,25 @@ fun CameraScreen(vm: CameraViewModel, onOpenSettings: () -> Unit) {
                 factory = { GlCameraView(it, vm.pipe) },
                 modifier = Modifier.fillMaxSize()
             )
+            // ---------------- system viewfinder (last-resort rung) ----------------
+            // Rendered by the platform's own PreviewView: the compositor
+            // path the stock camera app uses, engaged only after every GL
+            // viewfinder shape was declared degenerate. Photos (and their
+            // effects) still go through the GL pipeline underneath.
+            if (state.vfSystem) {
+                AndroidView(
+                    factory = { ctx ->
+                        androidx.camera.view.PreviewView(ctx).apply {
+                            scaleType = androidx.camera.view.PreviewView.ScaleType.FILL_CENTER
+                            implementationMode =
+                                androidx.camera.view.PreviewView.ImplementationMode.PERFORMANCE
+                            vm.controller?.attachSystemPreviewView(this)
+                        }
+                    },
+                    onRelease = { pv -> vm.controller?.detachSystemPreviewView(pv) },
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
         }
 
         GridOverlay(state.cameraPrefs.grid)
@@ -265,6 +284,72 @@ fun CameraScreen(vm: CameraViewModel, onOpenSettings: () -> Unit) {
                     drawCircle(RecRed)
                 }
                 RecTimeBadge(state.recordingStartMs, state.recordingPaused)
+            }
+        }
+
+        // ---------------- degenerate-stream banner ----------------
+        // The live probe found perfectly flat frames at every resolution:
+        // the camera is feeding broken data. Point at the diagnostics.
+        if (state.streamSuspect && !state.recording) {
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = Color.Black.copy(alpha = 0.65f),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = 96.dp)
+            ) {
+                Text(
+                    text = "Camera stream looks corrupted - run Settings > Camera diagnostics",
+                    color = ChromeOn,
+                    fontSize = 12.sp,
+                    textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                )
+            }
+        }
+
+        // ---------------- compatibility viewfinder chip ----------------
+        // The GL preview path was declared degenerate at every resolution;
+        // the viewfinder is now running on CPU-converted frames (working,
+        // slightly softer). Reassure instead of alarming.
+        if (state.vfCompat && !state.vfSystem && !state.streamSuspect && !state.recording) {
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = Color.Black.copy(alpha = 0.55f),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = 96.dp)
+            ) {
+                Text(
+                    text = "Compatibility viewfinder",
+                    color = ChromeOn,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                )
+            }
+        }
+
+        // ---------------- system viewfinder chip ----------------
+        // The last-resort rung: the live view comes from the platform's own
+        // renderer. Photos still get every effect; only the live preview
+        // shows the clean image.
+        if (state.vfSystem && !state.streamSuspect && !state.recording) {
+            Surface(
+                shape = RoundedCornerShape(14.dp),
+                color = Color.Black.copy(alpha = 0.55f),
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .padding(top = 96.dp)
+            ) {
+                Text(
+                    text = "System viewfinder - effects still apply to photos",
+                    color = ChromeOn,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
+                )
             }
         }
 
