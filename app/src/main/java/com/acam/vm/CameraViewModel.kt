@@ -219,6 +219,23 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 version = 2
             )
         }
+        if (s.version < 3) {
+            // 1.2.6: the actual viewfinder root cause (the non-affine
+            // Mat4.rotation, m15 = 0 - see GlUtils.kt) is fixed. Devices
+            // that lived through the broken era may still be pinned to the
+            // CPU / system viewfinder or a fallen-back preview rung; clear
+            // those persisted fallbacks once more so every device retries
+            // the (now working) GL preview from the top rung.
+            s = s.copy(
+                ui = s.ui.copy(
+                    vfCpuMode = false,
+                    vfSystemMode = false,
+                    previewW = 0,
+                    previewH = 0
+                ),
+                version = 3
+            )
+        }
         return s
     }
 

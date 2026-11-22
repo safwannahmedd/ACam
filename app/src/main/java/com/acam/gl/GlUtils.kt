@@ -237,28 +237,39 @@ object Mat4 {
     /** Upright -> stream rotation in UV space. deg must be 0/90/180/270.
      *  NOTE: the pipeline always passes (360 - rot) here, because a
      *  clockwise image-space rotation is a counter-clockwise UV-space
-     *  rotation (see the object docs). */
+     *  rotation (see the object docs).
+     *
+     *  THE 1.2.6 FIX: every non-identity branch used to end in m15 = 0
+     *  instead of 1 - a NON-AFFINE matrix. Composed into B * R * C, the
+     *  zeroed w-row ate the translation terms of everything after it:
+     *  v_uv went negative for every fragment, clamped to 0, and the whole
+     *  screen rendered ONE row of the camera texture, each texel blown up
+     *  into a full-width band - the "viewfinder is insanely zoomed / flat
+     *  while photos are fine" bug (photos survived only on devices whose
+     *  still captures arrive pre-rotated, i.e. rotationDeg = 0 = identity).
+     *  Verified by simulation: with m15 = 1 the rot = 90 chain reproduces
+     *  the reference rotated + center-cropped image with zero error. */
     fun rotation(deg: Int): FloatArray = when (((deg % 360) + 360) % 360) {
         // x' = y,        y' = 1 - x
         90 -> floatArrayOf(
             0f, -1f, 0f, 0f,
             1f, 0f, 0f, 0f,
             0f, 0f, 1f, 0f,
-            0f, 1f, 0f, 0f
+            0f, 1f, 0f, 1f
         )
         // x' = 1 - x,    y' = 1 - y
         180 -> floatArrayOf(
             -1f, 0f, 0f, 0f,
             0f, -1f, 0f, 0f,
             0f, 0f, 1f, 0f,
-            1f, 1f, 0f, 0f
+            1f, 1f, 0f, 1f
         )
         // x' = 1 - y,    y' = x
         270 -> floatArrayOf(
             0f, 1f, 0f, 0f,
             -1f, 0f, 0f, 0f,
             0f, 0f, 1f, 0f,
-            1f, 0f, 0f, 0f
+            1f, 0f, 0f, 1f
         )
         else -> identity()
     }
