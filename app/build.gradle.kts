@@ -19,9 +19,9 @@ android {
         //   Every fix/update increments X: A.B.X -> A.B.(X+1).
         //   When X reaches 10: X rolls to 0 and B increments.
         //   When B reaches 10: B rolls to 0 and A increments.
-        //   versionCode is simply +1 per release (9 -> 1.2.3 -> 1.2.4).
-        versionCode = 10
-        versionName = "1.2.4"
+        //   versionCode is simply +1 per release (9 -> 1.2.3 -> 1.2.4 -> 1.2.5).
+        versionCode = 11
+        versionName = "1.2.5"
     }
 
     buildTypes {

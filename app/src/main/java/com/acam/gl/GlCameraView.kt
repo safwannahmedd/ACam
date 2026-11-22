@@ -27,7 +27,11 @@ class PipeConfig(
     val outH: Int = 1080,
     val mirror: Boolean = false,
     val displayRotation: Int = 0,
-    val sensorOrientation: Int = 90
+    val sensorOrientation: Int = 90,
+    /** Live viewfinder zoom (user pinch). Applied DIGITALLY by the renderer
+     *  on viewfinder sessions (see [GlPipe.viewfinderHwZoom] and the 1.2.5
+     *  fix in onDrawFrame); the still capture keeps its own hardware zoom. */
+    val zoom: Float = 1f
 )
 
 /** Recording configuration, resolved (encoder-clamped) by the view model. */
@@ -121,6 +125,22 @@ class GlPipe(private val appContext: Context) {
      * controller; read by the renderer on every frame.
      */
     @Volatile var cpuFallback: Boolean = false
+
+    /**
+     * THE 1.2.5 ZOOM FIX: true while the CURRENT viewfinder session zooms in
+     * hardware (classic Preview+still binding, or the system PreviewView).
+     * While false (the default single-stream viewfinder shapes), the camera
+     * control is pinned to 1x and the renderer applies [PipeConfig.zoom]
+     * digitally instead. Budget HALs implement zoom as a sensor-space
+     * scaler.cropRegion and mangle every NON-still stream they apply it to
+     * (a ~2000px rect landing on a 640x480 buffer = clamped corner sliver /
+     * memset field / torn rows: the "extremely zoomed / flat / striped
+     * viewfinder, photos perfect" failure). Keeping the crop region away
+     * from viewfinder streams removes that entire failure class. Written by
+     * the controller at bind time; read by the renderer and the tap-to-focus
+     * mapping.
+     */
+    @Volatile var viewfinderHwZoom: Boolean = false
 
     /** Newest-wins slot for the CPU-converted viewfinder frame. The
      *  controller's analyzer thread publishes, the GL thread consumes. */
@@ -458,8 +478,17 @@ class GlPipe(private val appContext: Context) {
             // counter-clockwise UV rotation, so the matrix gets (360-rot)).
             val rot = ((cfg.sensorOrientation - cfg.displayRotation) % 360 + 360) % 360
             val (csx, csy) = Framing.cropScale(streamW, streamH, rot, cfg.outW, cfg.outH)
+            // THE 1.2.5 ZOOM FIX: the viewfinder zooms DIGITALLY - the
+            // sampled window shrinks by the zoom factor around the center,
+            // uniformly on both axes so the output aspect (and therefore the
+            // crop already computed above) is preserved. Sessions that zoom
+            // in hardware (classic Preview+still, system viewfinder) keep a
+            // factor of 1 here so the zoom is never applied twice. This is
+            // the same visual result the HAL's crop would give a healthy
+            // stream, minus every way a budget HAL can mangle it.
+            val zoom = if (viewfinderHwZoom) 1f else cfg.zoom.coerceAtLeast(1f)
             System.arraycopy(Mat4.rotation((360 - rot) % 360), 0, rotMat, 0, 16)
-            System.arraycopy(Mat4.crop(csx, csy), 0, cropMat, 0, 16)
+            System.arraycopy(Mat4.crop(csx / zoom, csy / zoom), 0, cropMat, 0, 16)
             // The base transform: the (sanitized) SurfaceTexture transform
             // on the OES path, the plain top-down flip on the CPU-frame path
             // (row 0 of a GLUtils-uploaded bitmap lands at v = 0, exactly

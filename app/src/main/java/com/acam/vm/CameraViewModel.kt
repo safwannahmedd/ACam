@@ -203,6 +203,22 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             }
             s = s.copy(version = 1)
         }
+        if (s.version < 2) {
+            // 1.2.5: the viewfinder zoom rework (viewfinder streams never
+            // see a hardware zoom crop any more) removes the root cause that
+            // pushed devices onto the CPU / system fallbacks. Clear the
+            // persisted fallback choices ONCE so the now-clean GL ladder is
+            // re-evaluated instead of starting pinned to a fallback.
+            s = s.copy(
+                ui = s.ui.copy(
+                    vfCpuMode = false,
+                    vfSystemMode = false,
+                    previewW = 0,
+                    previewH = 0
+                ),
+                version = 2
+            )
+        }
         return s
     }
 
@@ -253,7 +269,12 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 outH = size.h,
                 mirror = mirror,
                 displayRotation = s.displayRotation,
-                sensorOrientation = s.caps?.sensorOrientation ?: 90
+                sensorOrientation = s.caps?.sensorOrientation ?: 90,
+                // The pinch zoom. The renderer applies it digitally on
+                // viewfinder-only sessions (the 1.2.5 fix - budget HALs
+                // mangle non-still streams when zoom is a sensor-space
+                // crop region); hardware-zoomed sessions ignore it.
+                zoom = s.cameraPrefs.zoom
             )
         )
     }
@@ -851,11 +872,15 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
         val size = resolvedSize(s)
         val rot = ((caps.sensorOrientation - s.displayRotation) % 360 + 360) % 360
         val (csx, csy) = Framing.cropScale(pipe.streamW, pipe.streamH, rot, size.w, size.h)
+        // Match the renderer's zoom window (digital zoom on viewfinder-only
+        // sessions - the 1.2.5 fix): a tap on the visible frame lands inside
+        // the zoomed window by construction, exactly as before.
+        val zoom = if (pipe.viewfinderHwZoom) 1f else s.cameraPrefs.zoom.coerceAtLeast(1f)
         val mirror = caps.isFront && s.cameraPrefs.mirrorFront
         val uv = Framing.viewToStream(
             viewX, viewY, viewW, viewH,
             size.w.toFloat(), size.h.toFloat(),
-            rot, mirror, csx, csy
+            rot, mirror, csx / zoom, csy / zoom
         ) ?: return
         controller?.focusAt(uv.first * pipe.streamW, uv.second * pipe.streamH)
     }

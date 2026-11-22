@@ -137,6 +137,29 @@ class CameraController(
     )
     private var previewIdx = 0
 
+    /** CPU-fallback analysis resolutions, sharpest first. The first rung is
+     *  sharp enough to read on a modern screen (the 640x480 rung the CPU
+     *  viewfinder used to run at was the "compatibility viewfinder is
+     *  blurry" report); the second is the camera1 universal every HAL can
+     *  drive. The rungs drop automatically when the frame verification
+     *  rejects the sharpest one - and only then does the system viewfinder
+     *  take over. */
+    private val cpuLadder = listOf(
+        Size(1280, 960),   // sharp: ~2x the detail of VGA on screen
+        Size(640, 480)     // the camera1 universal, the last CPU rung
+    )
+    private var cpuIdx = 0
+
+    /** Generation of the current CPU-session binding. Guards the stale
+     *  "no frames at all" timers of previous rungs - and queued duplicate
+     *  escalations from the analyzer thread - from double-dropping while a
+     *  freshly rebound rung is still opening the camera. */
+    @Volatile private var cpuBindGen = 0
+
+    /** What the camera session is CURRENTLY bound for (set at bind time;
+     *  drives the 1.2.5 zoom routing in applyPrefs). */
+    @Volatile private var sessionMode = SessionMode.LIVE
+
     private val bgExecutor: Executor = Executors.newSingleThreadExecutor()
     private val analyzerExecutor: Executor = Executors.newSingleThreadExecutor()
     private val diagExecutor: Executor = Executors.newSingleThreadExecutor()
@@ -286,6 +309,13 @@ class CameraController(
                 it.width == saved.width && it.height == saved.height
             }
             if (idx >= 0) previewIdx = idx
+            // The same remembered rung positions the CPU ladder (both
+            // ladders share the 4:3 rungs), so a device that had to drop
+            // to VGA does not re-live the drop in front of the user.
+            val cpuIdxSaved = cpuLadder.indexOfFirst {
+                it.width == saved.width && it.height == saved.height
+            }
+            if (cpuIdxSaved >= 0) cpuIdx = cpuIdxSaved
         }
         if (systemVfPrefProvider()) {
             // The whole GL ladder (including the CPU rung) was declared
@@ -534,6 +564,7 @@ class CameraController(
             return
         }
         val entry = entries.getOrNull(activeIndex) ?: return
+        sessionMode = effMode
         try {
             val selector = activeSelector(entry)
             val compat = compatProvider()
@@ -595,19 +626,32 @@ class CameraController(
                 SessionMode.CPU -> {
                     fallbackSeen = 0
                     fallbackBadRun = 0
-                    val analysis = buildFallbackAnalysis()
+                    val rung = cpuLadder[cpuIdx]
+                    val analysis = buildFallbackAnalysis(rung)
                     analysis.setAnalyzer(analyzerExecutor, ::onFallbackFrame)
                     camera = provider.bindToLifecycle(lifecycleOwner, selector, analysis)
-                    // If the HAL cannot deliver even analysis frames, fall
-                    // through to the system viewfinder instead of sitting on
-                    // a black viewfinder forever.
+                    // If the HAL cannot deliver even analysis frames, drop to
+                    // the next CPU rung (and only then to the system viewfinder)
+                    // instead of sitting on a black viewfinder forever. The
+                    // generation guard keeps a stale timer from a previous
+                    // rung from double-escalating a slow camera open.
+                    val gen = ++cpuBindGen
                     mainHandler.postDelayed({
-                        if (cpuFallback && !systemVf && fallbackSeen == 0) {
-                            engageSystemVf("no analysis frames at all")
+                        if (gen == cpuBindGen && cpuFallback && !systemVf && fallbackSeen == 0) {
+                            escalateCpuViewfinder("no analysis frames at ${rung.width}x${rung.height}")
                         }
                     }, CPU_NO_FRAMES_MS)
                 }
             }
+
+            // THE 1.2.5 ZOOM FIX: record whether THIS session's viewfinder
+            // zooms in hardware, so the renderer (and the tap-to-focus
+            // mapping) can mirror the decision - hardware-zoomed sessions
+            // must not zoom again in the shader, viewfinder-only sessions
+            // must (the camera control itself stays pinned at 1x for them).
+            pipe.viewfinderHwZoom =
+                (effMode == SessionMode.LIVE && imageCapture != null) ||
+                    effMode == SessionMode.SYS
 
             val camera = this.camera ?: return
             val characteristics = Camera2CameraInfo.extractCameraCharacteristics(camera.cameraInfo)
@@ -807,6 +851,34 @@ class CameraController(
     }
 
     /**
+     * The CPU viewfinder's frames were declared degenerate (or absent) at
+     * the current rung. Try the next smaller analysis size first - the
+     * camera1-universal VGA rung is the one every HAL can actually drive -
+     * and only when even that fails, escalate to the system viewfinder
+     * (engageSystemVf). May run on the analyzer thread; the rebind hops
+     * to the main thread. [gen] pins the escalation to the binding it was
+     * raised against: a rung rebind invalidates stale queued escalations,
+     * so two consecutive bad frames can never skip a rung.
+     */
+    private fun escalateCpuViewfinder(reason: String, gen: Int = cpuBindGen) {
+        if (systemVf) return
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { escalateCpuViewfinder(reason, gen) }
+            return
+        }
+        if (systemVf || gen != cpuBindGen) return
+        if (cpuIdx < cpuLadder.lastIndex) {
+            cpuIdx++
+            val next = cpuLadder[cpuIdx]
+            Log.e(TAG, "CPU viewfinder degenerate ($reason) - retrying at ${next.width}x${next.height}")
+            onAnalysisFallback?.invoke(next)
+            bind(SessionMode.CPU)
+        } else {
+            engageSystemVf(reason)
+        }
+    }
+
+    /**
      * The UI composed the PreviewView for the system viewfinder (or is
      * replacing a detached one). Bind the camera onto it if SYS mode is
      * active. Called from the AndroidView factory on the main thread.
@@ -863,13 +935,13 @@ class CameraController(
     }
 
     /** The ImageAnalysis use case behind the CPU compatibility viewfinder:
-     * one small 4:3 stream at the camera1-universal size. */
-    private fun buildFallbackAnalysis(): ImageAnalysis {
+     * one small 4:3 stream at the given ladder rung's size. */
+    private fun buildFallbackAnalysis(size: Size): ImageAnalysis {
         val res = ResolutionSelector.Builder()
             .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
             .setResolutionStrategy(
                 ResolutionStrategy(
-                    Size(640, 480),
+                    size,
                     ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
                 )
             )
@@ -955,7 +1027,7 @@ class CameraController(
                 // clear this is chronic, escalate to the system viewfinder.
                 fallbackBadRun++
                 if (fallbackBadRun >= 8 && fallbackSeen >= 12 && !systemVf) {
-                    engageSystemVf(
+                    escalateCpuViewfinder(
                         if (torn) "CPU frames torn (var=%.1f, spread=%.0f)"
                             .format(withinVar, rowSpread) else "CPU frames flat (mean=$mean)"
                     )
@@ -964,6 +1036,11 @@ class CameraController(
             }
 
             fallbackBadRun = 0
+            // Remember the healthy CPU rung exactly like the GL ladder's
+            // probe does, so the next launch starts on it instead of re-
+            // dropping resolution in front of the user. (The view model
+            // dedupes; this only writes when the rung changes.)
+            if (!systemVf) onPreviewRungHealthy?.invoke(w, h)
             if (streamSuspect) {
                 streamSuspect = false
                 onStreamSuspect?.invoke(false)
@@ -1183,7 +1260,23 @@ class CameraController(
 
         Camera2CameraControl.from(camera.cameraControl).setCaptureRequestOptions(builder.build())
 
-        camera.cameraControl.setZoomRatio(prefs.zoom.coerceIn(1f, caps.maxZoom))
+        // THE 1.2.5 ZOOM FIX: hardware zoom - which on budget HALs is a
+        // sensor-space scaler.cropRegion - is applied ONLY to the sessions
+        // whose streams the HAL provably crops correctly: the still capture
+        // (full-resolution, the stream every photo ever taken on the
+        // affected devices came from) and the system PreviewView. The
+        // viewfinder-only sessions (GL OES preview, CPU analysis frames)
+        // stay pinned at 1x and zoom DIGITALLY in the pipeline instead:
+        // budget HALs apply the sensor-space crop rect to small buffers
+        // literally, where it lands far out of bounds - the "extremely
+        // zoomed / flat / striped viewfinder while photos stay perfect"
+        // failure that appeared on every zoom pinch.
+        val hwZoom = sessionMode == SessionMode.STILL ||
+            sessionMode == SessionMode.SYS ||
+            (sessionMode == SessionMode.LIVE && imageCapture != null)
+        camera.cameraControl.setZoomRatio(
+            if (hwZoom) prefs.zoom.coerceIn(1f, caps.maxZoom) else 1f
+        )
         camera.cameraControl.enableTorch(captureFlash || prefs.flashMode == com.acam.data.FlashMode.TORCH)
     }
 
