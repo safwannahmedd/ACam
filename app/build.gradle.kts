@@ -20,8 +20,9 @@ android {
         //   When X reaches 10: X rolls to 0 and B increments.
         //   When B reaches 10: B rolls to 0 and A increments.
         //   versionCode is simply +1 per release (9 -> 1.2.3 -> 1.2.4 -> 1.2.5).
-        versionCode = 14
-        versionName = "1.2.8"
+        //   1.3.5: user-requested rename of the 1.2.8 filters release + new app icon.
+        versionCode = 15
+        versionName = "1.3.5"
     }
 
     buildTypes {
